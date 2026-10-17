@@ -1,0 +1,6 @@
+*.exe
+.idea/
+.workbuddy-ai/
+
+# local-only AI design draft (dev credential, not published)
+DESIGN.md
