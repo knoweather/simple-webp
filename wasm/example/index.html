@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>simple-webp · WASM decoder demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; }
+    canvas { border: 1px solid #ccc; image-rendering: pixelated; max-width: 100%; }
+    #info { color: #555; margin-top: .5rem; }
+    #err { color: #c00; margin-top: .5rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>simple-webp · WASM decoder (read only)</h1>
+  <p>Pick a <code>.webp</code> file to decode it entirely in the browser.</p>
+  <input id="file" type="file" accept=".webp,image/webp" />
+  <div id="err"></div>
+  <canvas id="canvas"></canvas>
+  <div id="info"></div>
+
+  <!-- WASM glue provided by the Go toolchain. -->
+  <script src="wasm_exec.js"></script>
+  <script>
+    const go = new Go();
+    WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject)
+      .then((result) => {
+        go.run(result.instance);
+        document.getElementById("info").textContent =
+          "wasm ready — pick a .webp file";
+      })
+      .catch((e) => {
+        document.getElementById("err").textContent = "failed to load wasm: " + e;
+      });
+
+    document.getElementById("file").addEventListener("change", (ev) => {
+      const file = ev.target.files[0];
+      if (!file) return;
+      document.getElementById("err").textContent = "";
+      file.arrayBuffer().then((buf) => {
+        // webpDecode accepts a Uint8Array or ArrayBuffer.
+        const res = webpDecode(new Uint8Array(buf));
+        if (res.error) {
+          document.getElementById("err").textContent = "decode error: " + res.error;
+          return;
+        }
+        const canvas = document.getElementById("canvas");
+        canvas.width = res.width;
+        canvas.height = res.height;
+        const ctx = canvas.getContext("2d");
+        // rgba is a Uint8Array; ImageData needs Uint8ClampedArray.
+        const imgData = new ImageData(
+          new Uint8ClampedArray(res.rgba),
+          res.width,
+          res.height
+        );
+        ctx.putImageData(imgData, 0, 0);
+        document.getElementById("info").textContent =
+          `${res.width}×${res.height}  ` +
+          `alpha=${res.hasAlpha}  animation=${res.hasAnimation}`;
+      });
+    });
+  </script>
+</body>
+</html>

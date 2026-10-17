@@ -190,6 +190,22 @@ Tighten the budget yourself, e.g. trust only small images:
 img, err := w.ToImageWith(simple_webp.DecodeOptions{MaxPixels: 4096 * 4096})
 ```
 
+## WebAssembly (read-only decode)
+
+`wasm/` ships a WebAssembly **decoder only**: it turns a WebP byte stream into
+RGBA pixels ready for `<canvas>` — no re-encoding, no writes. Encoding is out
+of scope.
+
+- Build: `wasm/build.ps1` (Windows) or `wasm/build.sh`; output is
+  `wasm/example/main.wasm` plus a copied `wasm_exec.js`.
+- JS API (installed on the global object by `wasm.Register()`):
+  - `webpDecode(bytes) -> { width, height, hasAlpha, hasAnimation, rgba }`
+    (returns `{ error }` on failure)
+  - `webpInfo(bytes)   -> { width, height, hasAlpha, hasAnimation }` (no pixel decode)
+  - `bytes` may be a `Uint8Array` or `ArrayBuffer`; `rgba` is a straight-alpha
+    `Uint8Array` that must be consumed synchronously (Go-managed memory).
+- Full demo: `wasm/example/index.html` and `wasm/README.md`.
+
 ## Testing
 
 ```bash

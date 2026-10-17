@@ -193,6 +193,23 @@ img, err := w.ToImageWith(simple_webp.DecodeOptions{MaxPixels: 4096 * 4096})
 
 ---
 
+## WebAssembly（只读解码）
+
+`wasm/` 提供 WebAssembly **仅解码**前端：把 WebP 字节流转成 RGBA 像素，
+可直接画到 `<canvas>` 上——不重编码、不做写入，编码不在范围内。
+
+- 构建：`wasm/build.ps1`（Windows）/ `wasm/build.sh`；产物为
+  `wasm/example/main.wasm` 与复制好的 `wasm_exec.js`。
+- JS API（由 `wasm.Register()` 安装到全局对象）：
+  - `webpDecode(bytes) -> { width, height, hasAlpha, hasAnimation, rgba }`
+    （失败返回 `{ error }`）
+  - `webpInfo(bytes)   -> { width, height, hasAlpha, hasAnimation }`（不解码像素）
+  - `bytes` 可传 `Uint8Array` 或 `ArrayBuffer`；`rgba` 为直通 alpha 的
+    `Uint8Array`，须同步消费（Go 托管内存）。
+- 完整示例：`wasm/example/index.html` 与 `wasm/README.md`。
+
+---
+
 ## 测试
 
 ```bash
