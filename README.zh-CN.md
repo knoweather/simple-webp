@@ -1,5 +1,8 @@
 # simple-webp
 
+> [!NOTE]
+> 🚀 **首次发版，灰度测试中。** 有任何问题或建议，欢迎提 [issue](https://github.com/knoweather/simple-webp/issues)！
+
 [English](./README.md) | **简体中文**
 
 纯 Go 的 WebP 解析 / 解码 / 编码库——无 cgo、无第三方运行时依赖。容器解析、

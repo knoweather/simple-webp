@@ -1,5 +1,8 @@
 # simple-webp
 
+> [!NOTE]
+> 🚀 **Initial release, canary testing in progress.** If you hit any problem, please open an [issue](https://github.com/knoweather/simple-webp/issues)!
+
 **English** | [简体中文](./README.zh-CN.md)
 
 Pure-Go WebP parse / decode / encode — no cgo, no third-party runtime
