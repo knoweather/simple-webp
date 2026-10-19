@@ -200,11 +200,16 @@ of scope.
   `wasm/example/main.wasm` plus a copied `wasm_exec.js`.
 - JS API (installed on the global object by `wasm.Register()`):
   - `webpDecode(bytes) -> { width, height, hasAlpha, hasAnimation, rgba }`
-    (returns `{ error }` on failure)
-  - `webpInfo(bytes)   -> { width, height, hasAlpha, hasAnimation }` (no pixel decode)
+    (returns `{ error }` on failure; first frame for animations)
+  - `webpDecodeFrames(bytes) -> [ { width, height, duration, rgba }, … ]`
+    (all animation frames at canvas size; a still image yields one frame)
+  - `webpInfo(bytes) -> { width, height, hasAlpha, hasAnimation, hasICC,
+    hasEXIF, hasXMP, frameCount }` (no pixel decode; VP8X flags + frame count)
   - `bytes` may be a `Uint8Array` or `ArrayBuffer`; `rgba` is a straight-alpha
     `Uint8Array` that must be consumed synchronously (Go-managed memory).
-- Full demo: `wasm/example/index.html` and `wasm/README.md`.
+- Decoding covers the full extended format: VP8X alpha (lossless and lossy
+  `VP8X+ALPH`), animation (`VP8X+ANIM+ANMF`), and the ICC/EXIF/XMP metadata
+  flags. Full demo: `wasm/example/index.html` and `wasm/README.md`.
 
 ## Testing
 
