@@ -10,12 +10,17 @@ import (
 )
 
 func init() {
+	// 让 image.Decode 与 image.DecodeConfig 识别 webp 文件
 	// makes image.Decode and image.DecodeConfig recognize webp files
 	image.RegisterFormat("webp", "RIFF????WEBP", Decode, DecodeConfig)
 }
 
+// Decode 读取 webp 流并返回解码后的图像，实现 image.Decode 签名。
+// 动图会返回合成后的画布帧。
+//
 // Decode reads a webp stream and returns the decoded image, implementing the
-// image.Decode signature.
+// image.Decode signature. For animated files it returns the composited
+// canvas frame.
 func Decode(r io.Reader) (image.Image, error) {
 	w, err := ParseWebp(r)
 	if err != nil {
@@ -24,8 +29,14 @@ func Decode(r io.Reader) (image.Image, error) {
 	return w.ToImage()
 }
 
-// DecodeConfig reads only the container header, it does not decode any pixel
-// data.
+// DecodeConfig 只读取容器头部（RIFF 头 + 第一个决定尺寸的 chunk），
+// 不解码任何像素数据，因此开销很小。VP8X、VP8、VP8L 三种 chunk 都被
+// 支持；颜色模型固定返回 NRGBAModel。
+//
+// DecodeConfig reads only the container header (the RIFF header plus the
+// first chunk that determines the size) and decodes no pixel data at all,
+// so it is cheap. It supports the VP8X, VP8 and VP8L chunks; the color
+// model is always NRGBAModel.
 func DecodeConfig(r io.Reader) (image.Config, error) {
 	var head [12]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
@@ -89,7 +100,8 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 			cfg.Height = int(bits>>14&0x3fff) + 1
 			return cfg, nil
 		default:
-			// skip the payload and its padding byte
+			// 跳过 chunk 载荷及其补齐字节（奇数长度后有一个 padding 字节）
+			// skip the payload and its padding byte (odd sizes get one byte of padding)
 			skip := int64(size) + int64(size&1)
 			if _, err := io.CopyN(io.Discard, r, skip); err != nil {
 				return image.Config{}, errors.WithMessagef(err, "invalid webp: truncated %q chunk", string(name))
@@ -98,8 +110,12 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 	}
 }
 
-// Image decodes the image once and caches the result, it backs the
-// image.Image implementation of Webp.
+// Image 只解码一次并缓存结果，是 Webp 实现 image.Image 的基础：
+// 首次调用触发完整解码，之后（含失败原因）都复用同一结果。
+//
+// Image decodes the image once and caches the result; it backs the
+// image.Image implementation of Webp. The first call triggers the full
+// decode; later calls reuse the same result, including any error.
 func (w *Webp) Image() (image.Image, error) {
 	w.Once.Do(func() {
 		w.img, w.imgErr = w.ToImage()
@@ -107,19 +123,30 @@ func (w *Webp) Image() (image.Image, error) {
 	return w.img, w.imgErr
 }
 
-// Bounds implements image.Image: the canvas rectangle of the file.
+// Bounds 实现 image.Image：返回文件的画布矩形（从原点开始，宽高来自头部）。
+//
+// Bounds implements image.Image: it returns the canvas rectangle of the file
+// (origin at (0,0), size taken from the header).
 func (w *Webp) Bounds() image.Rectangle {
 	return image.Rect(0, 0, w.Width, w.Height)
 }
 
+// ColorModel 实现 image.Image。解码器输出的是 straight alpha（非预乘）
+// NRGBA 像素，因此这里固定返回 color.NRGBAModel。
+//
 // ColorModel implements image.Image. The decoders produce straight alpha
-// NRGBA pixels.
+// (non-premultiplied) NRGBA pixels, so color.NRGBAModel is returned
+// unconditionally.
 func (w *Webp) ColorModel() color.Model {
 	return color.NRGBAModel
 }
 
-// At implements image.Image. The image is decoded on the first call and then
-// cached.
+// At 实现 image.Image。图像在首次调用时才解码并缓存；解码失败时
+// 返回透明的 color.NRGBA{}。
+//
+// At implements image.Image. The image is decoded lazily on the first call
+// and cached afterwards; if decoding fails, a transparent color.NRGBA{} is
+// returned.
 func (w *Webp) At(x, y int) color.Color {
 	img, err := w.Image()
 	if err != nil {
@@ -128,6 +155,9 @@ func (w *Webp) At(x, y int) color.Color {
 	return img.At(x, y)
 }
 
+// drawCopy 通过 image/draw 把 straight alpha 的 NRGBA 图像转换为预乘的
+// RGBA 图像；image/draw 对这一对类型有专门优化路径。
+//
 // drawCopy converts a straight alpha NRGBA image into a premultiplied RGBA
 // one through image/draw, which has an optimized path for this pair.
 func drawCopy(dst *image.RGBA, src *image.NRGBA) {

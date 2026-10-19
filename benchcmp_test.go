@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-// formatOf reports the dominant bitstream kind for a parsed WebP.
+// formatOf 返回已解析 WebP 的主导码流类别：无损、有损、动画，或未知。
+//
+// formatOf reports the dominant bitstream kind of a parsed WebP: lossless,
+// lossy, animation, or unknown.
 func formatOf(w *Webp) string {
 	switch {
 	case w.VP8L != nil:
@@ -23,9 +26,13 @@ func formatOf(w *Webp) string {
 	}
 }
 
-// BenchmarkCmpAll is a micro-benchmark that mirrors bench_c.c against libwebp:
-// read the file once, then decode it N times in a tight loop and report the
-// average wall-clock decode time and throughput in millions of pixels/second.
+// BenchmarkCmpAll 是与 libwebp 的 bench_c.c 对齐的微基准：文件只读一次，
+// 随后在紧凑循环里解码 N 次，报告平均墙钟解码耗时与每秒百万像素吞吐。
+// 运行方式：go test -bench=BenchmarkCmpAll -benchtime=200x -v
+//
+// BenchmarkCmpAll is a micro-benchmark that mirrors libwebp's bench_c.c:
+// the file is read once, then decoded N times in a tight loop, reporting
+// the average wall-clock decode time and throughput in megapixels/second.
 // Run with: go test -bench=BenchmarkCmpAll -benchtime=200x -v
 func BenchmarkCmpAll(b *testing.B) {
 	files, err := filepath.Glob("testdata/*.webp")
@@ -43,7 +50,8 @@ func BenchmarkCmpAll(b *testing.B) {
 			if err != nil {
 				b.Skip(err)
 			}
-			// warm up caches / JIT
+			// 预热缓存与 JIT。
+			// Warm up caches and the JIT.
 			for k := 0; k < 3; k++ {
 				if _, err := w.ToImage(); err != nil {
 					b.Skip(err)

@@ -11,17 +11,26 @@ import (
 	"github.com/knoweather/simple-webp/internal/vp8l"
 )
 
+// EncodeOptions 调节无损编码器的行为。
+//
 // EncodeOptions tunes the lossless encoder.
 type EncodeOptions struct {
+	// Lossless 仅为信息性字段：本库只写出无损 WebP，因此该值被接受但忽略。
+	//
 	// Lossless is informational: this library only writes lossless webp, so
 	// the value is accepted and ignored.
 	Lossless bool
+	// Method 以速度换压缩率：0 只存储字面量，1 追加减绿（subtract green）
+	// 变换、颜色索引和 LZ77，2（默认）再应用预测器变换。
+	//
 	// Method trades speed for size: 0 stores literals only, 1 adds the
 	// subtract green transform, colour indexing and LZ77, 2 (the default)
 	// also applies a predictor transform.
 	Method int
 }
 
+// Encode 把 m 编码为无损 WebP 文件并写入 w。
+//
 // Encode writes m as a lossless WebP file.
 func Encode(w io.Writer, m image.Image, opt *EncodeOptions) error {
 	data, err := EncodeBytes(m, opt)
@@ -32,6 +41,8 @@ func Encode(w io.Writer, m image.Image, opt *EncodeOptions) error {
 	return err
 }
 
+// EncodeBytes 把 m 编码为完整的无损 WebP 文件并保留在内存中返回。
+//
 // EncodeBytes encodes m as a lossless WebP file held in memory.
 func EncodeBytes(m image.Image, opt *EncodeOptions) ([]byte, error) {
 	if m == nil {
@@ -64,6 +75,9 @@ func EncodeBytes(m image.Image, opt *EncodeOptions) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// imageToARGB 把任意 image.Image 转成 0xAARRGGBB 像素切片，借助 image/draw
+// 统一处理所有源布局。
+//
 // imageToARGB converts any image.Image into 0xAARRGGBB pixels, using
 // image/draw so every source layout is handled by the standard library.
 func imageToARGB(m image.Image) []uint32 {

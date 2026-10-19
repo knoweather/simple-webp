@@ -5,8 +5,11 @@ import (
 	"testing"
 )
 
-// TestDecodeFile decodes a raw VP8L bitstream (a VP8L chunk payload, header
-// included) and writes the RGBA pixels to the file named by VP8L_TEST_OUT so
+// TestDecodeFile 解码原始 VP8L 比特流（即含文件头的 VP8L chunk 载荷），
+// 并把 RGBA 像素写入 VP8L_TEST_OUT 指定的文件，以便与参考解码器逐像素比对。
+//
+// TestDecodeFile decodes a raw VP8L bitstream (a VP8L chunk payload with its
+// header) and writes the RGBA pixels to the file named by VP8L_TEST_OUT so
 // they can be compared against a reference decoder.
 func TestDecodeFile(t *testing.T) {
 	in := os.Getenv("VP8L_TEST_FILE")

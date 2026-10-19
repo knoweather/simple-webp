@@ -8,8 +8,14 @@ import (
 	"github.com/knoweather/simple-webp/internal/vp8l"
 )
 
-// decodeAlphaPlane decompresses the alpha plane of a lossy image and reverses
-// the alpha filtering.
+// decodeAlphaPlane 解压有损 WebP 图像的 alpha 平面数据，并逆向还原 alpha 过滤。
+// 无压缩模式下 alpha.Data 必须至少含 width*height 字节；无损模式委托给
+// vp8l 解码器，二者均会随后逆向应用过滤器。
+//
+// decodeAlphaPlane decompresses the alpha plane of a lossy WebP image and
+// reverses the alpha filtering. In uncompressed mode alpha.Data must hold at
+// least width*height bytes; in lossless mode decoding is delegated to the
+// vp8l decoder. Both paths unfilter the plane afterwards.
 func decodeAlphaPlane(alpha *ALPH, width, height int) ([]byte, error) {
 	if width <= 0 || height <= 0 {
 		return nil, errors.New("webp: invalid alpha size")
@@ -34,8 +40,12 @@ func decodeAlphaPlane(alpha *ALPH, width, height int) ([]byte, error) {
 	return nil, errors.Errorf("webp: unsupported alpha compression %d", alpha.Compression)
 }
 
+// unfilterAlpha 逆向 alpha 平面的水平、垂直或梯度过滤，
+// 就地把预测差分值还原为真实 alpha 值（模 256 加法）。
+//
 // unfilterAlpha reverses the horizontal, vertical or gradient filter of an
-// alpha plane.
+// alpha plane in place, turning predictive deltas back into real alpha values
+// (addition modulo 256).
 func unfilterAlpha(plane []byte, width, height int, filter uint8) {
 	switch filter {
 	case ALPHFilterHorizontal:
@@ -77,7 +87,11 @@ func unfilterAlpha(plane []byte, width, height int, filter uint8) {
 	}
 }
 
-// applyAlpha writes the decoded alpha plane into the image.
+// applyAlpha 解码 alpha 平面并把每个像素的 alpha 值写入 NRGBA 图像
+// （每个像素的第 4 个字节，即 A 通道）。
+//
+// applyAlpha decodes the alpha plane and writes each pixel's alpha value
+// into the NRGBA image (the 4th byte of each pixel, the A channel).
 func applyAlpha(img *image.NRGBA, alpha *ALPH) error {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -85,7 +99,9 @@ func applyAlpha(img *image.NRGBA, alpha *ALPH) error {
 	if err != nil {
 		return err
 	}
-	// A preprocessing of "level reduction" stores fewer alpha levels; the
+	// "电平缩减"预处理只存储较少的 alpha 级别，参考解码器会用抖动
+	// 还原；这里直接保留原始值，与抖动结果的偏差在一个量化步长内。
+	// A "level reduction" preprocessing stores fewer alpha levels; the
 	// reference decoder dithers them back. The values are kept as they are,
 	// which is within one quantization step of the dithered result.
 	for y := 0; y < h; y++ {

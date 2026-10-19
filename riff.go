@@ -7,13 +7,17 @@ import (
 	"github.com/pkg/errors"
 )
 
-// webp is a RIFF container: every multi-byte integer is little-endian.
+// by is the byte order of the RIFF container: every multi-byte integer in a
+// WebP stream is little-endian, as mandated by the RIFF specification.
 var by = binary.LittleEndian
 
 // FourCC is a 4 byte chunk type code, e.g. "VP8L".
 type FourCC string
 
-// The chunk types of the WebP container, see
+// Chunk type codes of the WebP container, see
+// https://developers.google.com/speed/webp/docs/riff_container
+//
+// WebP 容器的各 chunk 类型码，见
 // https://developers.google.com/speed/webp/docs/riff_container
 const (
 	RIFFChunk FourCC = "RIFF"
@@ -35,18 +39,24 @@ var (
 	webpTag = []byte("WEBP")
 )
 
-// maxChunkSize is the largest chunk payload accepted while parsing, it keeps
+// maxChunkSize is the largest chunk payload accepted while parsing; it keeps
 // a corrupt length field from allocating gigabytes.
+//
+// maxChunkSize 是解析时接受的最大 chunk 载荷长度，防止损坏的长度字段触发 GB 级分配。
 const maxChunkSize = 1 << 30
 
 // riffChunk is one chunk of the container in raw form: the four character
 // code and the payload without the 8 byte header and the padding byte.
+//
+// riffChunk 是容器中一个 chunk 的原始形态：四字符码加上载荷，不含 8 字节头部与填充字节。
 type riffChunk struct {
 	name FourCC
 	data []byte
 }
 
 // validFourCC reports whether every byte of the code is printable ASCII.
+//
+// validFourCC 判断码的每个字节是否都是可打印 ASCII（RIFF 要求 chunk 类型为可打印字符）。
 func validFourCC(name FourCC) bool {
 	if len(name) != 4 {
 		return false
@@ -62,6 +72,9 @@ func validFourCC(name FourCC) bool {
 // readRiffChunk reads one chunk: fourcc, uint32 payload size, payload and the
 // padding byte that is present when the payload size is odd.
 // It returns io.EOF when the stream ends exactly at a chunk boundary.
+//
+// readRiffChunk 读取一个 chunk：四字符码、uint32 载荷长度、载荷，以及载荷长度为奇数时
+// 存在的 1 字节填充。若流恰好结束在 chunk 边界上，则返回 io.EOF。
 func readRiffChunk(r io.Reader) (*riffChunk, error) {
 	var head [8]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
@@ -93,11 +106,15 @@ func readRiffChunk(r io.Reader) (*riffChunk, error) {
 
 // chunkSize returns the number of bytes a chunk occupies in the stream,
 // including its 8 byte header and the padding byte.
+//
+// chunkSize 返回一个 chunk 在流中占据的字节数，含 8 字节头部与（长度为奇数时的）填充字节。
 func chunkSize(dataLen int) int {
 	return 8 + dataLen + dataLen&1
 }
 
 // writeRiffChunk writes one chunk including the padding byte.
+//
+// writeRiffChunk 写出一个 chunk，含头部与填充字节。
 func writeRiffChunk(w io.Writer, name FourCC, data []byte) error {
 	if !validFourCC(name) {
 		return errors.Errorf("invalid chunk type %q", string(name))
@@ -124,6 +141,8 @@ func writeRiffChunk(w io.Writer, name FourCC, data []byte) error {
 }
 
 // marshalRiffChunk builds the bytes of one chunk including header and padding.
+//
+// marshalRiffChunk 拼出一个 chunk 的完整字节：头部、载荷与填充字节。
 func marshalRiffChunk(name FourCC, data []byte) []byte {
 	out := make([]byte, 0, chunkSize(len(data)))
 	var head [8]byte
@@ -138,11 +157,15 @@ func marshalRiffChunk(name FourCC, data []byte) []byte {
 }
 
 // readUint24 reads a 24 bit little-endian unsigned integer.
+//
+// readUint24 按小端序读出 24 位无符号整数（ANIM/ANMF 帧定时字段使用）。
 func readUint24(b []byte) uint32 {
 	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16
 }
 
 // writeUint24 writes a 24 bit little-endian unsigned integer into b[:3].
+//
+// writeUint24 按小端序把 24 位无符号整数写入 b[:3]。
 func writeUint24(b []byte, v uint32) {
 	b[0] = byte(v)
 	b[1] = byte(v >> 8)

@@ -1,16 +1,24 @@
 package vp8
 
+// 宏块解码：预测模式与 DCT/WHT 系数 token 的解析与重建。
 // Macroblock decoding: prediction modes and DCT/WHT coefficient tokens.
 
+// mbState 保存宏块解码过程中供相邻宏块参考的状态。
+// mbState holds the state that neighbouring macroblocks refer to during decoding.
 type mbState struct {
+	// pred 存放下方或右侧 4x4 区域的预测模式。
 	// pred holds the predictor modes of the bottom or right 4x4 regions.
 	pred [4]uint8
+	// nzMask 每个 4x4 区域占一位：亮度 4 位，色度按 2+2 位打包。
 	// nzMask has one bit per 4x4 region: 4 for luma, 2+2 for chroma.
 	nzMask uint8
+	// nzY16 在 Y16 宏块存在非零系数时为 1。
 	// nzY16 is 1 when a Y16 macroblock has non zero coefficients.
 	nzY16 uint8
 }
 
+// unpackMask 把 4 位非零掩码展开成每 4x4 区域一个字节的 [4]uint8。
+// unpackMask expands a 4-bit non zero mask into one byte per 4x4 region.
 var unpackMask = [16][4]uint8{
 	{0, 0, 0, 0},
 	{1, 0, 0, 0},
@@ -30,6 +38,8 @@ var unpackMask = [16][4]uint8{
 	{1, 1, 1, 1},
 }
 
+// btou 把布尔值转成 0/1，便于参与按位运算。
+// btou converts a boolean to 0/1 so it can take part in bit arithmetic.
 func btou(b bool) uint8 {
 	if b {
 		return 1
@@ -37,13 +47,19 @@ func btou(b bool) uint8 {
 	return 0
 }
 
+// packMask 把 4 个区域标志打包成 4 位掩码，再左移 shift 位。
+// packMask packs four region flags into a 4-bit mask shifted left by shift.
 func packMask(v [4]uint8, shift int) uint32 {
 	u := uint32(v[0]) | uint32(v[1])<<1 | uint32(v[2])<<2 | uint32(v[3])<<3
 	return u << uint(shift)
 }
 
+// checkTopLeftPred 在帧边界上把 DC 模式替换为它的单边变体：左列用
+// predDCLeft，顶行用 predDCTop，左上角用 predDCTopLeft。
+//
 // checkTopLeftPred replaces the DC mode by its one sided variant on the frame
-// borders.
+// borders: predDCLeft on the left column, predDCTop on the top row and
+// predDCTopLeft at the top-left corner.
 func checkTopLeftPred(mbx, mby int, p uint8) uint8 {
 	if p != predDC {
 		return p
@@ -60,7 +76,11 @@ func checkTopLeftPred(mbx, mby int, p uint8) uint8 {
 	return predDC
 }
 
-// parsePredModeY16 reads the 16x16 luma mode, section 11.2.
+// parsePredModeY16 读取 16x16 亮度预测模式（规范 11.2 节），并把它写入
+// 上方与左侧宏块的参考状态。
+//
+// parsePredModeY16 reads the 16x16 luma mode, section 11.2, and writes it
+// into the above and left macroblock reference state.
 func (d *decoder) parsePredModeY16(mbx int) {
 	var p uint8
 	if !d.fp.readBit(156) {
@@ -81,6 +101,7 @@ func (d *decoder) parsePredModeY16(mbx int) {
 	d.predY16 = p
 }
 
+// parsePredModeC8 读取 8x8 色度预测模式（规范 11.4 节）。
 // parsePredModeC8 reads the chroma mode, section 11.4.
 func (d *decoder) parsePredModeC8() {
 	if !d.fp.readBit(142) {
@@ -94,7 +115,12 @@ func (d *decoder) parsePredModeC8() {
 	}
 }
 
-// parsePredModeY4 reads the sixteen 4x4 luma modes, section 11.5.
+// parsePredModeY4 按上下文概率树读取 16 个 4x4 亮度预测模式（规范 11.5 节）；
+// 当前模式 p 在块之间滚动传递，上方与左侧参考状态随之更新。
+//
+// parsePredModeY4 reads the sixteen 4x4 luma modes, section 11.5, using the
+// context probability tree; the current mode p carries over between blocks
+// and the above/left reference state is updated as it goes.
 func (d *decoder) parsePredModeY4(mbx int) {
 	for j := 0; j < 4; j++ {
 		p := d.leftMB.pred[j]
@@ -130,8 +156,14 @@ func (d *decoder) parsePredModeY4(mbx int) {
 	}
 }
 
+// parseResiduals4 解码一个 4x4 块的系数 token（规范 13.3 节）。skipDC=true
+// 时跳过 DC 系数（用于走 Y2 的 Y16 宏块）；q[0]/q[1] 分别是 DC/AC 量化因子，
+// coeffBase 是系数写入 d.coeff 的基址。至少有一个非零系数时返回 1。
+//
 // parseResiduals4 decodes one 4x4 block of coefficient tokens, section 13.3.
-// It returns 1 when at least one coefficient was non zero.
+// With skipDC=true it skips the DC coefficient (Y16 macroblocks that use
+// Y2); q[0]/q[1] are the DC/AC quantizers and coeffBase is the base offset
+// into d.coeff. It returns 1 when at least one coefficient was non zero.
 func (d *decoder) parseResiduals4(r *boolDecoder, plane, context int, q [2]uint16, skipDC bool, coeffBase int) uint8 {
 	prob := &d.tokenProb[plane]
 	n := 0
@@ -192,6 +224,9 @@ func (d *decoder) parseResiduals4(r *boolDecoder, plane, context int, q [2]uint1
 	return 1
 }
 
+// parseResiduals 解码整个宏块的所有系数，并报告该宏块是否完全没有系数；
+// 完全无系数时可以跳过内环路滤波。
+//
 // parseResiduals decodes every coefficient of the macroblock and reports
 // whether the macroblock has no coefficients at all, in which case the inner
 // loop filter can be skipped.
@@ -260,7 +295,12 @@ func (d *decoder) parseResiduals(mbx, mby int) (skip bool) {
 	return nzDCMask == 0 && nzACMask == 0
 }
 
-// reconstructMacroblock predicts the macroblock and adds the residuals.
+// reconstructMacroblock 对宏块做预测并叠加残差：AC 非零的块走完整 IDCT，
+// 只有 DC 非零的块走 DC-only 快速路径。
+//
+// reconstructMacroblock predicts the macroblock and adds the residuals:
+// blocks with non zero AC take the full IDCT, blocks with only a non zero DC
+// take the DC-only fast path.
 func (d *decoder) reconstructMacroblock(mbx, mby int) {
 	bx, by := mbx*16, mby*16
 	if d.usePredY16 {
@@ -309,6 +349,7 @@ func (d *decoder) reconstructMacroblock(mbx, mby int) {
 	}
 }
 
+// addIDCT8Plane 对 8x8 色度块的四个 4x4 子块做逆 DCT 并累加到像素上。
 // addIDCT8Plane applies the four 4x4 inverse DCTs of an 8x8 chroma block.
 func (d *decoder) addIDCT8Plane(p *plane, x, y, coeffBase int) {
 	d.addIDCT4Plane(p, x+0, y+0, coeffBase+0*16)
@@ -317,6 +358,8 @@ func (d *decoder) addIDCT8Plane(p *plane, x, y, coeffBase int) {
 	d.addIDCT4Plane(p, x+4, y+4, coeffBase+3*16)
 }
 
+// addIDCT8DCPlane 是 addIDCT8Plane 的 DC-only 快速路径。
+// addIDCT8DCPlane is the DC-only fast path of addIDCT8Plane.
 func (d *decoder) addIDCT8DCPlane(p *plane, x, y, coeffBase int) {
 	d.addIDCT4DCPlane(p, x+0, y+0, coeffBase+0*16)
 	d.addIDCT4DCPlane(p, x+4, y+0, coeffBase+1*16)

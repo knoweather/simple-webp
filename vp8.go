@@ -9,12 +9,18 @@ import (
 	"github.com/knoweather/simple-webp/internal/vp8"
 )
 
-// decodeVP8 decodes a lossy VP8 key frame into NRGBA pixels.
+// decodeVP8 用默认像素上限把有损 VP8 关键帧解码成 NRGBA 像素。
+//
+// decodeVP8 decodes a lossy VP8 key frame into NRGBA pixels using the
+// default pixel budget.
 func decodeVP8(v *VP8) (*image.NRGBA, error) {
 	return decodeVP8Limit(v, defaultMaxPixels)
 }
 
-// decodeVP8Limit decodes a lossy VP8 key frame with an explicit pixel budget.
+// decodeVP8Limit 用调用者给定的像素上限把有损 VP8 关键帧解码成 NRGBA 像素。
+//
+// decodeVP8Limit decodes a lossy VP8 key frame into NRGBA pixels with an
+// explicit pixel budget supplied by the caller.
 func decodeVP8Limit(v *VP8, maxPixels int) (*image.NRGBA, error) {
 	img, err := vp8.DecodeLimit(v.Data, maxPixels)
 	if err != nil {
@@ -23,7 +29,10 @@ func decodeVP8Limit(v *VP8, maxPixels int) (*image.NRGBA, error) {
 	return ycbcrToNRGBA(img), nil
 }
 
-// yuv conversion precomputed tables: tab[c] = (c*coeff)>>8 for c in 0..255,
+// YUV 转换预计算表：对 0..255 的 c，tab[c] = (c*coeff)>>8，热循环里查表
+// 代替乘法；系数取自 libwebp 的定点 BT.601 系数。
+//
+// Yuv conversion precomputed tables: tab[c] = (c*coeff)>>8 for c in 0..255,
 // so the hot loop does table lookups instead of multiplies, using libwebp's
 // fixed-point BT.601 coefficients.
 var (
@@ -34,6 +43,9 @@ var (
 	ubTab = [256]int{}
 )
 
+// init 在程序启动时填满五张预计算表。
+//
+// init fills the five precomputed tables at program start.
 func init() {
 	for i := 0; i < 256; i++ {
 		yTab[i] = (i * 19077) >> 8
@@ -44,6 +56,12 @@ func init() {
 	}
 }
 
+// ycbcrToNRGBA 把 4:2:0 帧转成非预乘 alpha 的 RGB。
+//
+// 色度平面用参考解码器的 9:3:3:1 "fancy" 滤波器上采样，再用 libwebp 的
+// BT.601 有限范围定点形式转换，因此结果与参考解码器一致。每行输出只读
+// 平面式 Y/Cb/Cr（此处只读），且写入互不重叠的目标行，所以转换按行带并行。
+//
 // ycbcrToNRGBA converts a 4:2:0 frame to straight alpha RGB.
 //
 // The chroma planes are upsampled with the 9:3:3:1 "fancy" filter of the
@@ -74,6 +92,9 @@ func ycbcrToNRGBA(src *image.YCbCr) *image.NRGBA {
 	return dst
 }
 
+// decodeBand 把 src 的行区间 [y0, y1) 转换进 dst。各带的目标行互不重叠、
+// 只读源平面，因此并发执行也没有数据竞争。
+//
 // decodeBand converts the rows [y0, y1) of src into dst. Bands are disjoint in
 // their destination rows and only read the source planes, so running them
 // concurrently is data-race free.
@@ -95,6 +116,8 @@ func decodeBand(dst *image.NRGBA, src *image.YCbCr, cw, ch, w, y0, y1 int, done 
 	}
 }
 
+// chromaAt 读取一个色度样本，坐标超出平面时截断到边缘。
+//
 // chromaAt reads one chroma sample, clamping the coordinates to the plane.
 func chromaAt(p []byte, stride, cw, ch, cx, cy int) int {
 	if cx < 0 {
@@ -110,6 +133,11 @@ func chromaAt(p []byte, stride, cw, ch, cx, cy int) int {
 	return int(p[cy*stride+cx])
 }
 
+// upsampleChroma 为亮度像素 (x, y) 插值出一个色度样本。
+//
+// 2x2 亮度块的色度样本与它的左上角像素共位，因此块内偏移 (dx, dy) 的像素
+// 按 9/16 该样本 + 3/16 水平邻居 + 3/16 垂直邻居 + 1/16 对角邻居混合。
+//
 // upsampleChroma interpolates one chroma sample for the luma pixel (x, y).
 //
 // The chroma sample of a 2x2 luma block is co-sited with its top left pixel,
@@ -132,6 +160,10 @@ func upsampleChroma(p []byte, stride, cw, ch, x, y int) int {
 	return (9*center + 3*h + 3*v + d + 8) >> 4
 }
 
+// yuvToRGB 用与参考解码器相同的定点系数和取整，把一组 BT.601 有限范围
+// YUV 转成 RGB。>>8 的乘积已在 yTab/vrTab/... 表里预计算，只剩最终的
+// >>6 和取整偏移。
+//
 // yuvToRGB converts one BT.601 limited range YUV triple with the same fixed
 // point coefficients and rounding as the reference decoder. The >>8 products
 // are precomputed in the yTab/vrTab/... tables, so only the final >>6 and the
@@ -143,6 +175,9 @@ func yuvToRGB(y, u, v int) (byte, byte, byte) {
 	return clip8(r), clip8(g), clip8(b)
 }
 
+// clip8 把 v 截断到 [0, 255] 范围。
+//
+// clip8 clamps v to the [0, 255] range.
 func clip8(v int) byte {
 	if v < 0 {
 		return 0

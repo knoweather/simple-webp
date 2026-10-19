@@ -1,23 +1,32 @@
 package vp8l
 
+// maxCodeLength 是规范允许的最长哈夫曼码长（比特）。
+// maxCodeLength is the longest Huffman code length (bits) allowed by the spec.
 const maxCodeLength = 15
 
+// kCodeLengthCodeOrder 是位流中存储 19 个码长编码之码长的顺序表（规范 Table 3-3）。
 // kCodeLengthCodeOrder is the order in which the 19 code length code lengths
-// are stored in the bitstream.
+// are stored in the bitstream (spec Table 3-3).
 var kCodeLengthCodeOrder = [19]int{17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 
+// huffmanTree 是一棵规范前缀码树：符号按码长计数（counts）逐位解码，
+// 方式与 DEFLATE 规范码的解码完全相同。
 // huffmanTree is a canonical prefix code. Codes are decoded one bit at a time
 // walking the code length counts, the same way the canonical codes of DEFLATE
 // are decoded.
 type huffmanTree struct {
 	counts  [maxCodeLength + 1]uint32
 	symbols []uint16
-	// single is the symbol of a tree that has only one leaf, such a tree
+	// single 是只有一个叶子的树所对应的符号；这种树每个符号消耗 0 比特，
+	// 普通树则取值 -1。
+	// single is the symbol of a tree that has only one leaf; such a tree
 	// consumes zero bits per symbol. It is -1 for a regular tree.
 	single int32
 }
 
-// decode reads one symbol from the bitstream.
+// decode 从位流中解出一个符号；遇到非法码时返回 errBadHuffmanCode。
+// decode reads one symbol from the bitstream. It returns errBadHuffmanCode
+// when the bits walked do not match any code.
 func (h *huffmanTree) decode(br *bitReader) (uint32, error) {
 	if h.single >= 0 {
 		return uint32(h.single), nil
@@ -36,6 +45,8 @@ func (h *huffmanTree) decode(br *bitReader) (uint32, error) {
 	return 0, errBadHuffmanCode
 }
 
+// buildHuffmanTree 由每个符号的码长构造规范前缀码：码集必须完备，
+// 唯一例外是只有一个叶子的树（该符号用 0 比特编码）。
 // buildHuffmanTree builds a canonical prefix code out of per-symbol code
 // lengths. The code must be complete, except for the single leaf case where
 // the one symbol is coded with zero bits.
@@ -61,7 +72,9 @@ func buildHuffmanTree(lengths []uint32) (*huffmanTree, error) {
 		return h, nil
 	}
 
-	// the code must be complete: every branch of the binary tree is used
+	// 码集必须完备：二叉树的每个分支都要被用到（Kraft 不等式取等）。
+	// The code must be complete: every branch of the binary tree is used
+	// (Kraft inequality holds with equality).
 	left := 1
 	for l := 1; l <= maxCodeLength; l++ {
 		left <<= 1
@@ -74,8 +87,9 @@ func buildHuffmanTree(lengths []uint32) (*huffmanTree, error) {
 		return nil, errBadHuffmanCode
 	}
 
-	// symbols are stored ordered by code length, then by symbol value, which
-	// is the canonical ordering the decoder walks
+	// symbols 先按码长、再按符号值排序，正是解码器逐位遍历所依赖的规范序。
+	// Symbols are stored ordered by code length, then by symbol value, which
+	// is the canonical ordering the decoder walks.
 	h.symbols = make([]uint16, total)
 	var offsets [maxCodeLength + 2]uint32
 	for l := 1; l <= maxCodeLength; l++ {
@@ -90,12 +104,15 @@ func buildHuffmanTree(lengths []uint32) (*huffmanTree, error) {
 	return h, nil
 }
 
+// readHuffmanCode 从位流读取一段前缀码描述，并为 alphabetSize 个符号的字母表
+// 构建解码树。
 // readHuffmanCode reads one prefix code description from the bitstream and
 // builds the tree for an alphabet of alphabetSize symbols.
 func readHuffmanCode(br *bitReader, alphabetSize int) (*huffmanTree, error) {
 	lengths := make([]uint32, alphabetSize)
 
-	// simple code: one or two symbols with a one bit code
+	// 简单码：一或两个符号，各用 1 比特编码。
+	// Simple code: one or two symbols, each coded with one bit.
 	if br.readBit() == 1 {
 		numSymbols := int(br.readBits(1)) + 1
 		firstIs8Bits := br.readBits(1)
@@ -114,7 +131,8 @@ func readHuffmanCode(br *bitReader, alphabetSize int) (*huffmanTree, error) {
 		return buildHuffmanTree(lengths)
 	}
 
-	// normal code: the code lengths are themselves prefix coded
+	// 普通码：码长本身再用一层前缀码编码。
+	// Normal code: the code lengths are themselves prefix coded.
 	numCodeLengths := int(br.readBits(4)) + 4
 	var clLengths [19]uint32
 	for i := 0; i < numCodeLengths; i++ {
@@ -134,7 +152,8 @@ func readHuffmanCode(br *bitReader, alphabetSize int) (*huffmanTree, error) {
 		}
 	}
 
-	// code 16 repeats the previous non zero length, 17 and 18 emit zero runs
+	// 码 16 重复上一个非零码长，17 和 18 输出连续的零。
+	// Code 16 repeats the previous non zero length; 17 and 18 emit zero runs.
 	prevCodeLen := uint32(8)
 	symbol := 0
 	for symbol < alphabetSize && maxSymbol > 0 {

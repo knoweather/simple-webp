@@ -1,6 +1,11 @@
 package vp8
 
-// Intra prediction modes, section 11.
+// 帧内预测模式常量（VP8 规范 11 节）；末尾三个是帧边界上使用的 DC 单边
+// 变体：分别只依赖顶行、左列，或两者都不依赖。
+//
+// Intra prediction mode constants (VP8 spec section 11); the last three are
+// the one sided DC variants used on frame borders: they depend on the top
+// row only, the left column only, or neither.
 const (
 	predDC = iota
 	predTM
@@ -17,6 +22,9 @@ const (
 	predDCTopLeft
 )
 
+// plane 是帧的一个分量，上方和左侧各留一像素边框，预测时读取邻居不需要
+// 边界检查。亮度平面还在右侧多留四列，供 4x4 预测器的右上超出像素使用。
+//
 // plane is one component of the frame with a one pixel border above and to
 // the left, so that predictions can read their neighbours without bounds
 // checks. Luma planes also reserve four extra columns on the right for the
@@ -29,6 +37,10 @@ type plane struct {
 	right  int
 }
 
+// newPlane 分配平面缓冲：stride 含左侧一列边框，缓冲比 height 多一行。
+//
+// newPlane allocates a plane buffer: the stride includes the one pixel left
+// border and the buffer holds one row more than height.
 func newPlane(width, height, right int) *plane {
 	stride := width + right + 1
 	return &plane{
@@ -40,12 +52,17 @@ func newPlane(width, height, right int) *plane {
 	}
 }
 
+// at 返回像素 (x, y) 的下标，其中 (-1, -1) 是左上角边框像素。
+//
 // at returns the index of pixel (x, y), where (-1, -1) is the top left border
 // pixel.
 func (p *plane) at(x, y int) int {
 	return (y+1)*p.stride + x + 1
 }
 
+// initBorders 把顶行填成 127、左列填成 129，即规范 12.2 节为帧外像素
+// 规定的取值。
+//
 // initBorders fills the top row with 127 and the left column with 129, the
 // values section 12.2 prescribes for pixels outside the frame.
 func (p *plane) initBorders() {
@@ -57,6 +74,9 @@ func (p *plane) initBorders() {
 	}
 }
 
+// fillOverhang 把已解码行的最后一列复制到右侧附加列；最右侧的 4x4
+// 预测器把这些列当作右上像素。
+//
 // fillOverhang duplicates the last column of a decoded row into the extra
 // columns, which the rightmost 4x4 predictors use as their top-right pixels.
 func (p *plane) fillOverhang(y int) {
@@ -69,6 +89,9 @@ func (p *plane) fillOverhang(y int) {
 	}
 }
 
+// clip255 把 v 截断到 [0, 255] 范围。
+//
+// clip255 clamps v to the [0, 255] range.
 func clip255(v int) byte {
 	if v < 0 {
 		return 0
@@ -79,6 +102,9 @@ func clip255(v int) byte {
 	return byte(v)
 }
 
+// clipInt 把 v 截断到 [lo, hi] 范围。
+//
+// clipInt clamps v to the [lo, hi] range.
 func clipInt(v, lo, hi int) int {
 	if v < lo {
 		return lo
@@ -89,12 +115,18 @@ func clipInt(v, lo, hi int) int {
 	return v
 }
 
-// avg2 rounds (a+b)/2 up, avg3 is the smoothed average of the diagonal
-// predictor modes.
+// avg2 把 (a+b)/2 向上取整。
+//
+// avg2 rounds (a+b)/2 up.
 func avg2(a, b int) int { return (a + b + 1) >> 1 }
 
+// avg3 是对角预测模式使用的平滑平均 (a+2*b+c+2)/4。
+//
+// avg3 is the smoothed average (a+2*b+c+2)/4 used by the diagonal predictors.
 func avg3(a, b, c int) int { return (a + 2*b + c + 2) >> 2 }
 
+// predict4 以 (x, y) 为左上角写出 4x4 亮度预测块。
+//
 // predict4 writes the 4x4 predicted block with its top left corner at (x, y).
 func (d *decoder) predict4(mode uint8, x, y int) {
 	p := d.y
@@ -103,6 +135,10 @@ func (d *decoder) predict4(mode uint8, x, y int) {
 	c := int(p.pix[p.at(x+1, y-1)])
 	dd := int(p.pix[p.at(x+2, y-1)])
 	e := int(p.pix[p.at(x+3, y-1)])
+	// 宏块最右块右侧的四个像素取自宏块上方那一行，而不是块上方那一行：
+	// 此时右侧相邻宏块还没有解码。
+	// 宏块最右块右侧的四个像素取自宏块上方那一行，而不是该块上方那一行：
+	// 此时右侧相邻宏块还没有解码。
 	// The four pixels right of the rightmost block of a macroblock are taken
 	// from the row above the macroblock, not from the row above the block:
 	// the neighbouring macroblock has not been decoded yet at this point.
@@ -180,7 +216,8 @@ func (d *decoder) predict4(mode uint8, x, y int) {
 		d.set4(x, y+3, rqp, pab, abc, bcd)
 
 	case predLD:
-		// LD and VL only look at the top row, so their a..h are top[0..7]
+		// LD 与 VL 只看顶行，所以它们的 a..h 就是 top[0..7]。
+		// LD and VL only look at the top row, so their a..h are top[0..7].
 		abc := avg3(b, c, dd)
 		bcd := avg3(c, dd, e)
 		cde := avg3(dd, e, f)
@@ -239,6 +276,8 @@ func (d *decoder) predict4(mode uint8, x, y int) {
 	}
 }
 
+// set4 写出一行四个像素。
+//
 // set4 writes one row of four pixels.
 func (d *decoder) set4(x, y int, v0, v1, v2, v3 int) {
 	p := d.y
@@ -248,6 +287,9 @@ func (d *decoder) set4(x, y int, v0, v1, v2, v3 int) {
 	p.pix[p.at(x+3, y)] = clip255(v3)
 }
 
+// fillBlock4 把 4x4 块全部填充为常量 v。
+//
+// fillBlock4 fills a 4x4 block with the constant v.
 func (d *decoder) fillBlock4(x, y int, v byte) {
 	p := d.y
 	for j := 0; j < 4; j++ {
@@ -257,6 +299,8 @@ func (d *decoder) fillBlock4(x, y int, v byte) {
 	}
 }
 
+// predict8 在 (x, y) 处写出 8x8 色度预测块。
+//
 // predict8 writes the 8x8 chroma prediction block at (x, y).
 func (d *decoder) predict8(p *plane, mode uint8, x, y int) {
 	a := int(p.pix[p.at(x-1, y-1)])
@@ -305,6 +349,8 @@ func (d *decoder) predict8(p *plane, mode uint8, x, y int) {
 	}
 }
 
+// predict16 在 (x, y) 处写出 16x16 亮度预测块。
+//
 // predict16 writes the 16x16 luma prediction block at (x, y).
 func (d *decoder) predict16(mode uint8, x, y int) {
 	p := d.y
@@ -353,6 +399,9 @@ func (d *decoder) predict16(mode uint8, x, y int) {
 	}
 }
 
+// fillBlock 把 n x n 块填充为常量 v，逐行用整行写入。
+//
+// fillBlock fills an n x n block with the constant v, one full row at a time.
 func fillBlock(p *plane, x, y, n int, v byte) {
 	for j := 0; j < n; j++ {
 		row := p.pix[p.at(x, y+j) : p.at(x, y+j)+n]

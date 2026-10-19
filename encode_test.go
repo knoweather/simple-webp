@@ -9,6 +9,9 @@ import (
 	"testing"
 )
 
+// TestEncodeRoundTrip 用每种 method 编码每个解码后的测试文件，检查结果
+// 重新解码后像素一致。
+//
 // TestEncodeRoundTrip encodes every decoded fixture at each method and checks
 // that the result decodes back to the same pixels.
 func TestEncodeRoundTrip(t *testing.T) {
@@ -56,6 +59,8 @@ func TestEncodeRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeSinglePixel 检查最小可能图像（1×1）的编码。
+//
 // TestEncodeSinglePixel checks the smallest possible image.
 func TestEncodeSinglePixel(t *testing.T) {
 	src := image.NewNRGBA(image.Rect(0, 0, 1, 1))
@@ -78,6 +83,8 @@ func TestEncodeSinglePixel(t *testing.T) {
 	compareNRGBA(t, "1x1", img, src.Pix)
 }
 
+// TestEncodeUniform 检查大幅纯色图像，用以触发 LZ77 的长匹配路径。
+//
 // TestEncodeUniform checks a large flat image, which exercises long matches.
 func TestEncodeUniform(t *testing.T) {
 	src := image.NewNRGBA(image.Rect(0, 0, 200, 150))
@@ -98,6 +105,8 @@ func TestEncodeUniform(t *testing.T) {
 	compareNRGBA(t, "uniform", img, src.Pix)
 }
 
+// TestEncodeOutputDir 在设置 WEBP_ENCODE_DIR 时把编码结果写盘，供外部验证。
+//
 // TestEncodeOutputDir writes encoded files for external verification when
 // WEBP_ENCODE_DIR is set.
 func TestEncodeOutputDir(t *testing.T) {

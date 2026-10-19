@@ -6,12 +6,17 @@ const (
 	maxDimension  = 1 << 14
 	maxTransforms = 4
 	maxDepth      = 8
+	// maxHuffmanGroups 限制 meta 前缀码引用的码组数量，防止损坏的码流无节制地分配 Huffman 树。
+	//
 	// maxHuffmanGroups bounds the meta prefix code count so a corrupt file
-	// can not allocate an unbounded number of trees.
+	// cannot allocate an unbounded number of trees.
 	maxHuffmanGroups = 1 << 16
 )
 
+// planeCodeToXY 把 120 个短距离码映射为 (x, y) 偏移；码值本身按 1 起始（索引 = 码 - 1）。
+//
 // planeCodeToXY maps the 120 short distance codes to a (x, y) offset.
+// Codes are 1-based, so index = code - 1.
 var planeCodeToXY = [120][2]int8{
 	{0, 1}, {1, 0}, {1, 1}, {-1, 1}, {0, 2}, {2, 0}, {1, 2},
 	{-1, 2}, {2, 1}, {-2, 1}, {2, 2}, {-2, 2}, {0, 3}, {3, 0},
@@ -33,19 +38,30 @@ var planeCodeToXY = [120][2]int8{
 	{8, 7},
 }
 
+// huffmanGroup 是对一个块组编码的五棵前缀码树（绿、红、蓝、alpha 与距离）。
+//
 // huffmanGroup is the set of five prefix codes that codes one block group.
 type huffmanGroup struct {
 	green, red, blue, alpha, dist *huffmanTree
 }
 
+// decoder 持有码流读取器与递归深度计数；深度计数用于限制子图像的嵌套层数。
+//
+// decoder holds the bit-stream reader and a recursion depth counter; the
+// depth counter bounds how deeply sub-images may nest.
 type decoder struct {
 	br    *bitReader
 	depth int
 }
 
+// decodeImageStream 解码一幅空间编码图像：仅顶层图像可携带变换，子分辨率图像
+// （预测器数据、颜色数据、meta 前缀数据与调色板）都是普通熵编码图像。
+// 变换按写入顺序读取，逆变换按相反顺序应用。
+//
 // decodeImageStream decodes one spatially coded image. Only the top level
 // image carries transforms, the sub-resolution images (predictor data, color
 // data, meta prefix data and the palette) are plain entropy coded images.
+// Transforms are read in stream order and applied in reverse order.
 func (d *decoder) decodeImageStream(width, height int, isLevel0 bool) ([]uint32, error) {
 	if width <= 0 || height <= 0 || width > maxDimension || height > maxDimension {
 		return nil, errBadBitstream
@@ -68,7 +84,9 @@ func (d *decoder) decodeImageStream(width, height int, isLevel0 bool) ([]uint32,
 			}
 			transforms = append(transforms, t)
 			if t.kind == transformColorIndexing {
-				// the stored image is downsampled by the index packing
+				// 索引打包使存储宽度按 1<<t.bits 缩小，此处还原为子图像宽度。
+				// Index packing downsamples the stored image by 1<<t.bits;
+				// recover the stored sub-image width here.
 				width = divRoundUp(width, 1<<t.bits)
 			}
 		}
@@ -90,7 +108,10 @@ func (d *decoder) decodeImageStream(width, height int, isLevel0 bool) ([]uint32,
 	return pix, nil
 }
 
-// readTransform reads one transform description and its data.
+// readTransform 读取一条变换描述及其数据；子图像宽度按各变换的块大小缩放。
+//
+// readTransform reads one transform description and its data. The sub-image
+// dimensions are scaled down by the transform's block size.
 func (d *decoder) readTransform(width, height int) (*transform, error) {
 	kind := int(d.br.readBits(2))
 	t := &transform{kind: kind, xsize: width, ysize: height}
@@ -105,7 +126,7 @@ func (d *decoder) readTransform(width, height int) (*transform, error) {
 		}
 		t.data = data
 	case transformSubtractGreen:
-		// no data
+		// 该变换不携带数据 / this transform carries no data
 	case transformColorIndexing:
 		numColors := int(d.br.readBits(8)) + 1
 		data, err := d.decodeImageStream(numColors, 1, false)
@@ -121,9 +142,15 @@ func (d *decoder) readTransform(width, height int) (*transform, error) {
 	return t, nil
 }
 
+// decodeEntropyImage 解码颜色缓存信息、meta 前缀码图像与 LZ77 编码的像素流。
+// 仅顶层图像可携带 meta 前缀图像，子分辨率图像是普通熵编码图像。
+// 码组数量由 meta 图像中的最大索引推导，并受 maxHuffmanGroups 限制。
+//
 // decodeEntropyImage decodes the color cache info, the meta prefix codes and
 // the LZ77 coded pixel stream. Only the top level image may carry a meta
 // prefix image, the sub-resolution images are plain entropy coded images.
+// The group count derives from the largest index in the meta image and is
+// bounded by maxHuffmanGroups.
 func (d *decoder) decodeEntropyImage(width, height int, allowMeta bool) ([]uint32, error) {
 	cacheBits := 0
 	if d.br.readBit() == 1 {
@@ -193,7 +220,12 @@ func (d *decoder) decodeEntropyImage(width, height int, allowMeta bool) ([]uint3
 	return d.decodePixels(width, height, groups, huffImage, metaBits, cacheBits)
 }
 
-// decodePixels runs the LZ77 decoder over the image.
+// decodePixels 在图像上运行 LZ77 解码器：绿通道符号决定 literal、copy 或
+// 缓存引用；copy 的重叠拷贝语义与 VP8L 规范一致（逐像素向前推进）。
+//
+// decodePixels runs the LZ77 decoder over the image. The green symbol selects
+// a literal, a copy or a cache reference; overlapping copies advance one
+// pixel at a time, matching the VP8L specification.
 func (d *decoder) decodePixels(width, height int, groups []*huffmanGroup, huffImage []uint32, metaBits, cacheBits int) ([]uint32, error) {
 	pix := make([]uint32, width*height)
 	var cache []uint32
@@ -297,7 +329,12 @@ func (d *decoder) decodePixels(width, height int, groups []*huffmanGroup, huffIm
 	return pix, nil
 }
 
-// prefixValue decodes a length or distance prefix code with its extra bits.
+// prefixValue 解码长度或距离的前缀码及其附加位：前缀 < 4 直接返回 prefix+1，
+// 否则按规范的分段表用附加位扩展。
+//
+// prefixValue decodes a length or distance prefix code with its extra bits:
+// prefixes below 4 return prefix+1 directly, larger ones are extended per the
+// specification's segmented table.
 func prefixValue(br *bitReader, prefix uint32) uint32 {
 	if prefix < 4 {
 		return prefix + 1
@@ -307,9 +344,12 @@ func prefixValue(br *bitReader, prefix uint32) uint32 {
 	return offset + br.readBits(uint(extraBits)) + 1
 }
 
+// planeCodeToDistance 把距离码转换为像素距离：不超过 120 的码表示当前像素
+// 邻域内的 (x, y) 偏移，更大的码是整体偏移 120 后的直线距离；结果至少为 1。
+//
 // planeCodeToDistance converts a distance code to a pixel distance. Codes up
 // to 120 address the neighborhood of the current pixel, larger codes are
-// plain distances offset by 120.
+// plain distances offset by 120. The result is clamped to at least 1.
 func planeCodeToDistance(width, planeCode int) int {
 	if planeCode > len(planeCodeToXY) {
 		return planeCode - len(planeCodeToXY)

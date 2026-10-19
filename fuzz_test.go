@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+// FuzzParseWebp 检查任何输入都不会让解析器或解码器 panic。
+//
 // FuzzParseWebp checks that no input makes the parser or the decoders panic.
 func FuzzParseWebp(f *testing.F) {
 	for _, name := range []string{"tiny.webp", "gradient.webp", "lossy_smooth.webp", "alpha.webp"} {

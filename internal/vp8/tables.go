@@ -1,10 +1,22 @@
 package vp8
 
-// This file holds the constant tables of RFC 6386: the default and update
-// probabilities of the DCT coefficient tokens (sections 13.4 and 13.5), the
-// intra prediction mode probabilities (section 11.5), the dequantization
-// tables (section 14.1) and the coefficient band / zigzag orders.
+// 本文件汇集 VP8 解码所需的 RFC 6386 常量表：DCT 系数 token 的默认概率与
+// 概率更新标志（§13.4、§13.5）、帧内预测模式概率（§11.5）、反量化表
+// （§14.1），以及系数分带表与 zigzag 扫描序（§13.3）。全部为规范中的
+// 固定数据，任何单项数值都不得改动。
+//
+// This file holds the constant tables the VP8 decoder needs from RFC 6386:
+// the default and update probabilities of the DCT coefficient tokens
+// (sections 13.4 and 13.5), the intra prediction mode probabilities
+// (section 11.5), the dequantization tables (section 14.1) and the
+// coefficient band / zigzag orders (section 13.3). All of them are fixed
+// data from the specification; individual values must not be altered.
 
+// 概率表的平面类别：带 Y2 子块的 Y1 块、Y2 子块、UV 块、不含 Y2 的 Y1 块；
+// nPlane 为类别总数，作为系数概率表第一维的长度。
+// Plane classes used to index the token probability tables: a Y1 block whose
+// macroblock carries a Y2 sub-block, the Y2 sub-block itself, a UV block and
+// a Y1 block without Y2; nPlane is the number of classes.
 const (
 	planeY1WithY2 = iota
 	planeY2
@@ -13,15 +25,29 @@ const (
 	nPlane
 )
 
+// nPred 是帧内 4x4 预测模式的数量（不含各 DC 变体）。
 // nPred is the number of 4x4 predictor modes without the DC variants.
 const nPred = 10
 
+// 系数概率表的三个内部维度：系数分带数（§13.3 的 8 个 band）、上下文类别数
+// （邻块非零系数个数的 0/1/2+ 三档）、每个 token 二叉树的概率个数。
+// The three inner dimensions of the token probability tables: the number of
+// coefficient bands (8 bands, section 13.3), the context classes (0/1/2+
+// nonzero coefficients in the predictor block) and the number of binary
+// decisions per token.
 const (
 	nBand    = 8
 	nContext = 3
 	nProb    = 11
 )
 
+// tokenUpdateProb 是“概率更新”标志的算术编码概率表（RFC 6386 §13.5）：
+// 解码器在读取系数表之前先按此表逐项判断对应概率是否在码流中被更新，
+// 值 255 表示该项在编码器中从不更新。
+// tokenUpdateProb holds the probabilities used to code, for every entry of
+// the coefficient token tables, whether that probability is updated in the
+// bit stream (RFC 6386 §13.5); a value of 255 means the entry never changes
+// in the reference encoder and is therefore not coded at all.
 var tokenUpdateProb = [nPlane][nBand][nContext][nProb]uint8{
 	{
 		{
@@ -193,6 +219,11 @@ var tokenUpdateProb = [nPlane][nBand][nContext][nProb]uint8{
 	},
 }
 
+// defaultTokenProb 是系数 token 的默认概率表（RFC 6386 §13.4），为参考
+// 编码器输出的固定数据；码流未给出更新时解码器从这张表开始。
+// defaultTokenProb is the default probability table for DCT coefficient
+// tokens (RFC 6386 §13.4), the fixed output of the reference encoder; the
+// decoder starts from it whenever the bit stream carries no update.
 var defaultTokenProb = [nPlane][nBand][nContext][nProb]uint8{
 	{
 		{
@@ -364,6 +395,13 @@ var defaultTokenProb = [nPlane][nBand][nContext][nProb]uint8{
 	},
 }
 
+// predProb 是帧内 4x4 预测模式的条件概率表（RFC 6386 §11.5）：以上方、
+// 左方邻块的预测模式为索引，每个 (上,左) 组合给出 9 个概率，经二叉树
+// 解码出当前块的模式（共 10 种模式）。
+// predProb holds the conditional probabilities of the intra 4x4 prediction
+// modes (RFC 6386 §11.5): it is indexed by the above and left neighbour
+// modes, and each (above, left) entry carries the 9 probabilities that decode
+// the current block's mode through a binary tree over the 10 modes.
 var predProb = [nPred][nPred][9]uint8{
 	{
 		{231, 120, 48, 89, 115, 113, 120, 152, 112},
@@ -487,6 +525,10 @@ var predProb = [nPred][nPred][9]uint8{
 	},
 }
 
+// 反量化表（RFC 6386 §14.1）：DC 与 AC 系数各一张，按量化索引查表，
+// 每张 128 项。
+// Dequantization tables (RFC 6386 §14.1), one for the DC and one for the AC
+// coefficients, 128 entries each, looked up by quantization index.
 var (
 	dequantTableDC = [128]uint16{
 		4, 5, 6, 7, 8, 9, 10, 10,
@@ -526,13 +568,23 @@ var (
 	}
 )
 
-// Coefficient bands, section 13.3.
+// coeffBands 把 16 个 zigzag 扫描位置（外加 EOB 项）映射到 8 个系数分带
+// （RFC 6386 §13.3），解码时按分带选取概率。
+// coeffBands maps the 16 zigzag scan positions (plus the end-of-block entry)
+// to the 8 coefficient bands (RFC 6386 §13.3) used to select probabilities.
 var coeffBands = [17]uint8{0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0}
 
-// Zigzag order, section 13.3.
+// zigzag 是 4x4 块内系数的 zigzag 扫描顺序（RFC 6386 §13.3）。
+// zigzag is the zigzag scan order of the coefficients inside a 4x4 block
+// (RFC 6386 §13.3).
 var zigzag = [16]uint8{0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15}
 
-// Category probabilities for token categories 3 to 6, section 13.2.
+// cat3456 是 token 类别 3-6 的额外位概率表（RFC 6386 §13.2）：每行给出
+// 解码该类别剩余幅值位所需的概率，不足部分以 0 补齐到统一长度。
+// cat3456 holds the extra-bit probabilities for token categories 3 to 6
+// (RFC 6386 §13.2): each row lists the probabilities used to decode the
+// remaining magnitude bits of that category and is zero-padded to a uniform
+// length.
 var cat3456 = [4][12]uint8{
 	{173, 148, 140, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 	{176, 155, 140, 135, 0, 0, 0, 0, 0, 0, 0, 0},
