@@ -37,16 +37,54 @@
       if (!file) return;
       document.getElementById("err").textContent = "";
       file.arrayBuffer().then((buf) => {
-        // webpDecode accepts a Uint8Array or ArrayBuffer.
-        const res = webpDecode(new Uint8Array(buf));
+        const bytes = new Uint8Array(buf);
+
+        // Peek the container metadata first (no pixel decode).
+        const info = webpInfo(bytes);
+        if (info.error) {
+          document.getElementById("err").textContent = "info error: " + info.error;
+          return;
+        }
+
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d");
+
+        // Animated file: play every frame with webpDecodeFrames.
+        if (info.hasAnimation && info.frameCount > 0) {
+          const frames = webpDecodeFrames(bytes);
+          if (frames.error) {
+            document.getElementById("err").textContent = "decode error: " + frames.error;
+            return;
+          }
+          canvas.width = frames[0].width;
+          canvas.height = frames[0].height;
+          let i = 0;
+          const draw = () => {
+            const f = frames[i];
+            ctx.putImageData(
+              new ImageData(new Uint8ClampedArray(f.rgba), f.width, f.height),
+              0, 0
+            );
+            document.getElementById("info").textContent =
+              `${f.width}×${f.height}  frame ${i + 1}/${frames.length}` +
+              `  ${f.duration}ms  icc=${info.hasICC} exif=${info.hasEXIF} xmp=${info.hasXMP}`;
+            const d = f.duration > 0 ? f.duration : 100;
+            i = (i + 1) % frames.length;
+            setTimeout(draw, d);
+          };
+          draw();
+          return;
+        }
+
+        // Still image: decode once with webpDecode (also reads the first frame
+        // of any animation the metadata did not flag).
+        const res = webpDecode(bytes);
         if (res.error) {
           document.getElementById("err").textContent = "decode error: " + res.error;
           return;
         }
-        const canvas = document.getElementById("canvas");
         canvas.width = res.width;
         canvas.height = res.height;
-        const ctx = canvas.getContext("2d");
         // rgba is a Uint8Array; ImageData needs Uint8ClampedArray.
         const imgData = new ImageData(
           new Uint8ClampedArray(res.rgba),
@@ -56,7 +94,8 @@
         ctx.putImageData(imgData, 0, 0);
         document.getElementById("info").textContent =
           `${res.width}×${res.height}  ` +
-          `alpha=${res.hasAlpha}  animation=${res.hasAnimation}`;
+          `alpha=${res.hasAlpha}  ` +
+          `icc=${info.hasICC}  exif=${info.hasEXIF}  xmp=${info.hasXMP}`;
       });
     });
   </script>

@@ -12,6 +12,7 @@ import "github.com/knoweather/simple-webp/wasm"
 
 func main() {
 	wasm.Register()
+	// 永久阻塞，让 Go runtime 与它注册的 JS 回调随页面存活
 	// Block forever so the Go runtime — and the JS callbacks it registered —
 	// stay alive for the lifetime of the page.
 	select {}
