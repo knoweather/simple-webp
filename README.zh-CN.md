@@ -165,7 +165,7 @@ color transform）。
 
 ## 已知限制
 
-- **有损编码**未实现，`EncodeOptions.Quality` 不生效（只写无损）。
+- **有损编码**未实现，`EncodeOptions.Lossless` 被接受但忽略（只出 VP8L 无损）。
 - 编码器未实现 color transform 与 meta-Huffman 分块，压缩率低于 `cwebp`。
 - `ALPH` 的 `preprocessing=1`（level reduction）按原值输出，未做参考实现的抖动还原；
   cwebp 默认不产生该模式。

@@ -160,7 +160,7 @@ meta-Huffman / color transform yet).
 
 ## Known limitations
 
-- **Lossy encoding** not implemented — `EncodeOptions.Quality` has no effect (lossless only)
+- **Lossy encoding** not implemented — `EncodeOptions.Lossless` is accepted but ignored: every encode path writes lossless (VP8L) only
 - The encoder implements neither color transform nor meta-Huffman blocked
   coding, so compression is weaker than `cwebp`
 - `ALPH` `preprocessing=1` (level reduction) is passed through as-is, without
