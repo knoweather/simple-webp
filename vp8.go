@@ -75,38 +75,55 @@ func ycbcrToNRGBA(src *image.YCbCr) *image.NRGBA {
 	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
 	cw, ch := (w+1)/2, (h+1)/2
 	if h <= 32 {
-		decodeBand(dst, src, cw, ch, w, 0, h, func() {})
+		// 串行路径：两行色度暂存即可。
+		// Serial path: two chroma scratch rows are enough.
+		decodeBand(dst, src, cw, ch, w, 0, h, make([]byte, 2*w), func() {})
 		return dst
 	}
 	const bandH = 16
+	bands := (h + bandH - 1) / bandH
+	// 所有行带共享一次分配，每带拿 2*w 的一片（上行给 Cb、下行给 Cr）。
+	// One allocation shared by all bands; each band gets a 2*w slice
+	// (the first w entries hold Cb, the next w hold Cr).
+	rows := make([]byte, 2*w*bands)
 	var wg sync.WaitGroup
-	for y0 := 0; y0 < h; y0 += bandH {
+	for i, y0 := 0, 0; y0 < h; i, y0 = i+1, y0+bandH {
 		y1 := y0 + bandH
 		if y1 > h {
 			y1 = h
 		}
 		wg.Add(1)
-		go decodeBand(dst, src, cw, ch, w, y0, y1, wg.Done)
+		go decodeBand(dst, src, cw, ch, w, y0, y1, rows[i*2*w:(i+1)*2*w], wg.Done)
 	}
 	wg.Wait()
 	return dst
 }
 
 // decodeBand 把 src 的行区间 [y0, y1) 转换进 dst。各带的目标行互不重叠、
-// 只读源平面，因此并发执行也没有数据竞争。
+// 只读源平面，且各带持有自己的暂存（长度至少 2*w，前 w 个给 Cb、后 w 个
+// 给 Cr），因此并发执行也没有数据竞争。
 //
 // decodeBand converts the rows [y0, y1) of src into dst. Bands are disjoint in
-// their destination rows and only read the source planes, so running them
-// concurrently is data-race free.
-func decodeBand(dst *image.NRGBA, src *image.YCbCr, cw, ch, w, y0, y1 int, done func()) {
+// their destination rows and only read the source planes, and each band owns
+// its own scratch (at least 2*w long: the first w entries hold Cb, the next w
+// hold Cr), so running them concurrently is data-race free.
+func decodeBand(dst *image.NRGBA, src *image.YCbCr, cw, ch, w, y0, y1 int, scratch []byte, done func()) {
 	defer done()
+	uRow := scratch[:w]
+	vRow := scratch[w : 2*w]
 	for y := y0; y < y1; y++ {
 		yRow := src.Y[y*src.YStride : y*src.YStride+w]
 		dstRow := dst.Pix[y*dst.Stride : y*dst.Stride+w*4]
+
+		// 色度行指针只在一行内是常量，故每行只算一次。
+		// The chroma row pointers are constant within a row, so resolve them once.
+		cbC, cbV := chromaRowPair(src.Cb, src.CStride, cw, ch, y)
+		crC, crV := chromaRowPair(src.Cr, src.CStride, cw, ch, y)
+		upsampleChromaRow(uRow, cbC, cbV, cw, w)
+		upsampleChromaRow(vRow, crC, crV, cw, w)
+
 		for x := 0; x < w; x++ {
-			u := upsampleChroma(src.Cb, src.CStride, cw, ch, x, y)
-			v := upsampleChroma(src.Cr, src.CStride, cw, ch, x, y)
-			r, g, bl := yuvToRGB(int(yRow[x]), u, v)
+			r, g, bl := yuvToRGB(int(yRow[x]), int(uRow[x]), int(vRow[x]))
 			o := x * 4
 			dstRow[o+0] = r
 			dstRow[o+1] = g
