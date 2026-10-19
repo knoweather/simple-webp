@@ -1,12 +1,14 @@
 package vp8
 
-// Inverse transforms, sections 14.3 and 14.4.
+// 逆变换，见 RFC 6386 第 14.3、14.4 节。
+// Inverse transforms, sections 14.3 and 14.4 of RFC 6386.
 
 const (
-	idctC1 = 85627 // 65536 * cos(pi/8) * sqrt(2)
-	idctC2 = 35468 // 65536 * sin(pi/8) * sqrt(2)
+	idctC1 = 85627 // Q16 定标系数：65536 * cos(pi/8) * sqrt(2) / Q16 fixed-point coefficient: 65536 * cos(pi/8) * sqrt(2)
+	idctC2 = 35468 // Q16 定标系数：65536 * sin(pi/8) * sqrt(2) / Q16 fixed-point coefficient: 65536 * sin(pi/8) * sqrt(2)
 )
 
+// addIDCT4Plane 对一个 4x4 块做逆 DCT，并把结果加到平面 (x, y) 处的像素上。
 // addIDCT4Plane applies the inverse DCT of one 4x4 block and adds the result
 // to the plane at (x, y).
 func (d *decoder) addIDCT4Plane(p *plane, x, y, coeffBase int) {
@@ -39,6 +41,7 @@ func (d *decoder) addIDCT4Plane(p *plane, x, y, coeffBase int) {
 	}
 }
 
+// addIDCT4DCPlane 只处理仅有 DC 系数的块：把 DC 值均匀加到 4x4 像素上。
 // addIDCT4DCPlane adds a block that only has a DC coefficient.
 func (d *decoder) addIDCT4DCPlane(p *plane, x, y, coeffBase int) {
 	dc := (int32(d.coeff[coeffBase+0]) + 4) >> 3
@@ -50,6 +53,7 @@ func (d *decoder) addIDCT4DCPlane(p *plane, x, y, coeffBase int) {
 	}
 }
 
+// inverseWHT 对 Y2 块做逆 Walsh-Hamard 变换，并把得到的 DC 值分散写入 16 个亮度块。
 // inverseWHT applies the inverse Walsh Hadamard transform to the Y2 block and
 // scatters the resulting DC values into the 16 luma blocks.
 func (d *decoder) inverseWHT() {
@@ -80,6 +84,8 @@ func (d *decoder) inverseWHT() {
 	}
 }
 
+// clip8 把带符号值钳制到无符号 8 位范围 [0, 255]。
+// clip8 clamps a signed value to the unsigned 8 bit range [0, 255].
 func clip8(v int32) byte {
 	if v < 0 {
 		return 0

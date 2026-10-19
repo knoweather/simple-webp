@@ -5,14 +5,24 @@ import (
 	"math/bits"
 )
 
-// Encoder options.
+// Options 是 EncodeARGB 的压缩策略选项，目前只有 Method 一个字段。
+//
+// Options carries the compression strategy of EncodeARGB; it currently has a
+// single field, Method.
 type Options struct {
+	// Method 以速度换压缩率：0 只存储字面量，1（默认）追加减绿变换、颜色
+	// 索引与 LZ77，2 再启用预测变换。
 	// Method trades speed for size: 0 stores literals only, 1 (the default)
-	// adds the subtract green transform, colour indexing and LZ77, 2 also
-	// applies a predictor transform.
+	// adds the subtract green transform, colour indexing and LZ77, and 2
+	// also applies a predictor transform.
 	Method int
 }
 
+// 编码器调参：单个后向引用与搜索窗口的像素上限、哈希表位数、哈希链探测
+// 深度、最短匹配长度，以及预测块边长的对数（块边长为 2^predictorBits 像素）。
+// Encoder tuning: the pixel caps for one backward reference and for the search
+// window, the hash table bits, the hash chain probe depth, the minimum match
+// length, and the log2 of the predictor block edge (2^predictorBits pixels).
 const (
 	encoderMaxMatch = 4096
 	encoderWindow   = 1 << 20
@@ -22,10 +32,21 @@ const (
 	predictorBits   = 4
 )
 
+// errEmptyImage 报告宽高非正、或像素缓冲短于 width*height 的输入。
+//
+// errEmptyImage reports a non-positive dimension or a pixel buffer shorter
+// than width*height.
 var errEmptyImage = errors.New("vp8l: empty image")
 
-// EncodeARGB compresses 0xAARRGGBB pixels into a VP8L bitstream, header
-// included.
+// EncodeARGB 把 0xAARRGGBB 像素压缩为 VP8L 码流（含 5 字节流头）。宽高必须
+// 为正且不超过 maxDimension，len(pix) 不得小于 width*height，否则返回
+// errEmptyImage 或 ErrTooLarge；opt 为 nil 时使用默认策略（Method 1）。
+//
+// EncodeARGB compresses 0xAARRGGBB pixels into a VP8L bitstream, the 5-byte
+// stream header included. The dimensions must be positive and within
+// maxDimension and len(pix) must be at least width*height; otherwise
+// EncodeARGB returns errEmptyImage or ErrTooLarge. A nil opt selects the
+// default strategy (Method 1).
 func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 	if width <= 0 || height <= 0 || len(pix) < width*height {
 		return nil, errEmptyImage
@@ -43,7 +64,7 @@ func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 	e.w.writeBits(uint32(width-1), 14)
 	e.w.writeBits(uint32(height-1), 14)
 	e.w.writeBits(alphaUsed(pix), 1)
-	e.w.writeBits(0, 3) // version
+	e.w.writeBits(0, 3) // 流头 version 字段固定为 0 / the stream header version field is always 0
 
 	cur := pix
 	curW, curH := width, height
@@ -53,7 +74,7 @@ func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 			e.writeColorIndexing(palette, curW, curH)
 			cur, curW = indices, packedW
 		} else {
-			e.w.writeBits(1, 1) // transform present
+			e.w.writeBits(1, 1) // 变换标志：1 表示还有变换 / transform flag: 1 means a transform follows
 			e.w.writeBits(transformSubtractGreen, 2)
 			cur = subtractGreen(cur)
 			if method >= 2 {
@@ -61,13 +82,17 @@ func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 			}
 		}
 	}
-	e.w.writeBits(0, 1) // end of the transform list
+	e.w.writeBits(0, 1) // 变换列表结束：0 表示没有更多变换 / end of the transform list: 0 means no more transforms
 
 	e.writeEntropyImage(cur, curW, curH, true)
 	return e.w.finish(), nil
 }
 
-// alphaUsed reports whether any pixel is not fully opaque.
+// alphaUsed 报告是否存在 alpha 不等于 0xff 的像素；结果写入流头的
+// alpha_used 位。
+//
+// alphaUsed reports whether any pixel is not fully opaque (alpha != 0xff);
+// the result fills the alpha_used bit of the stream header.
 func alphaUsed(pix []uint32) uint32 {
 	for _, p := range pix {
 		if p>>24 != 0xff {
@@ -77,6 +102,12 @@ func alphaUsed(pix []uint32) uint32 {
 	return 0
 }
 
+// subtractGreen 返回减绿变换后的像素：R、B 两通道各自减去 G（模 256），
+// A 与 G 保持不变。这一无损预处理缩小了残差的数值范围，便于后续熵编码。
+//
+// subtractGreen applies the subtract green transform: channels R and B each
+// have G subtracted (mod 256) while A and G stay unchanged. The lossless
+// pre-pass narrows the residual range seen by the entropy coder.
 func subtractGreen(pix []uint32) []uint32 {
 	out := make([]uint32, len(pix))
 	for i, p := range pix {
@@ -88,6 +119,9 @@ func subtractGreen(pix []uint32) []uint32 {
 	return out
 }
 
+// subPixels 把两个 ARGB 像素逐通道按模 256 相减。四个通道必须一个一个
+// 处理：若把两个通道打包进一次减法，借位会从蓝色通道泄漏进红色通道。
+//
 // subPixels subtracts two ARGB pixels channel by channel, modulo 256. The
 // channels are handled one by one: packing two of them into one subtraction
 // would let a borrow leak from blue into red.
@@ -100,7 +134,15 @@ func subPixels(a, b uint32) uint32 {
 	return out
 }
 
+// colorIndex 构造至多 256 色的调色板与打包后的索引图。像素总数不足 32、
+// 或颜色种类超过 256 时放弃索引并返回 ok=false，由调用方回退到其他变换。
+// 成功时索引按 bitsPerPixel（1/2/4/8）打包进绿色通道，packedW 为打包后的行宽。
+//
 // colorIndex builds a palette of at most 256 colours and the packed indices.
+// It gives up and returns ok=false when the image has fewer than 32 pixels or
+// more than 256 distinct colours, so the caller can fall back to the other
+// transforms. On success the indices are packed into the green channel at
+// bitsPerPixel (1/2/4/8) and packedW is the packed row width.
 func colorIndex(pix []uint32, width, height int) (palette []uint32, indices []uint32, packedW int, ok bool) {
 	if width*height < 32 {
 		return nil, nil, 0, false
@@ -140,20 +182,25 @@ func colorIndex(pix []uint32, width, height int) (palette []uint32, indices []ui
 			out[y*packedW+x/pixelsPerByte] = packed
 		}
 	}
-	// the packed bytes are carried in the green channel
+	// 打包后的索引字节放进绿色通道传输 / the packed bytes are carried in the green channel
 	for i := range out {
 		out[i] <<= 8
 	}
 	return palette, out, packedW, true
 }
 
-// writeColorIndexing writes the colour indexing transform and its palette.
+// writeColorIndexing 写出颜色索引变换：先写变换类型与调色板大小减一，
+// 再把经差分编码的调色板作为一张单行熵编码图像写出。
+//
+// writeColorIndexing writes the colour indexing transform and its palette:
+// the transform type and the palette size minus one come first, then the
+// delta-coded palette is written as a one-row entropy coded image.
 func (e *encoder) writeColorIndexing(palette []uint32, width, height int) {
 	e.w.writeBits(1, 1)
 	e.w.writeBits(transformColorIndexing, 2)
 	e.w.writeBits(uint32(len(palette)-1), 8)
 
-	// the palette is delta coded, alpha first
+	// 调色板逐项差分编码，通道从 alpha 起算 / the palette is delta coded, alpha first
 	delta := make([]uint32, len(palette))
 	var prev uint32
 	for i, c := range palette {
@@ -163,7 +210,15 @@ func (e *encoder) writeColorIndexing(palette []uint32, width, height int) {
 	e.writeEntropyImage(delta, len(palette), 1, false)
 }
 
+// writePredictor 写出预测变换并返回残差图。图像划分为 2^predictorBits
+// 见方的块，每块从固定候选模式中按残差绝对值之和选最优预测模式；模式图本身
+// 作为一张熵编码图像写出，逐像素的预测残差则交给调用方继续熵编码。
+//
 // writePredictor writes the predictor transform and returns the residuals.
+// The image is split into 2^predictorBits-square blocks; each block picks its
+// predictor mode from a fixed candidate set by the summed absolute residual.
+// The mode image is written as its own entropy coded image, and the per-pixel
+// prediction residuals are returned to the caller for entropy coding.
 func (e *encoder) writePredictor(pix []uint32, width, height int) []uint32 {
 	blockW := divRoundUp(width, 1<<predictorBits)
 	blockH := divRoundUp(height, 1<<predictorBits)
@@ -189,7 +244,7 @@ func (e *encoder) writePredictor(pix []uint32, width, height int) []uint32 {
 		}
 	}
 
-	// the predictor image stores the mode in the green channel
+	// 模式图把模式号放进绿色通道 / the predictor image stores the mode in the green channel
 	predImage := make([]uint32, len(modes))
 	for i, m := range modes {
 		predImage[i] = 0xff000000 | m<<8
@@ -210,8 +265,14 @@ func (e *encoder) writePredictor(pix []uint32, width, height int) []uint32 {
 	return residual
 }
 
+// predictorAt 按解码器相同的规则计算单个像素的预测值：原点取不透明黑，
+// 首行、首列分别退化为左邻、上邻；最右列的 topRight 取本行首像素
+// （VP8L 规范的回绕规则）。
+//
 // predictorAt computes the predicted value of one pixel with the same rules
-// the decoder uses.
+// the decoder uses: the origin is opaque black, the first row and the first
+// column degrade to the left and top neighbours, and on the rightmost column
+// topRight wraps to the first pixel of the same row (the VP8L wrap-around rule).
 func predictorAt(pix []uint32, width, height, x, y, mode int) uint32 {
 	if x == 0 && y == 0 {
 		return 0xff000000
@@ -232,12 +293,19 @@ func predictorAt(pix []uint32, width, height, x, y, mode int) uint32 {
 	return predict(mode, left, top, topLeft, topRight)
 }
 
-// writeEntropyImage writes one entropy coded image: the colour cache flag,
-// the five prefix codes and the LZ77 coded pixels.
+// writeEntropyImage 写出一张熵编码图像：颜色缓存标志（本编码器恒不使用）、
+// 五组前缀码（绿、红、蓝、码长、距离）以及 LZ77 切分后的像素流。level0 为
+// 真时（流的最外层图像）再写一位，声明不使用元前缀图像。
+//
+// writeEntropyImage writes one entropy coded image: the colour cache flag
+// (never used by this encoder), the five prefix codes (green, red, blue, code
+// length and distance) and the LZ77 coded pixels. When level0 is true (the
+// outermost image of the stream) it also writes the bit that disables the meta
+// prefix image.
 func (e *encoder) writeEntropyImage(pix []uint32, width, height int, level0 bool) {
-	e.w.writeBits(0, 1) // no colour cache
+	e.w.writeBits(0, 1) // 不使用颜色缓存 / no colour cache
 	if level0 {
-		e.w.writeBits(0, 1) // no meta prefix image
+		e.w.writeBits(0, 1) // 不使用元前缀图像 / no meta prefix image
 	}
 
 	tokens := lz77(pix)
@@ -284,15 +352,28 @@ func (e *encoder) writeEntropyImage(pix []uint32, width, height int, level0 bool
 	}
 }
 
-// token is one LZ77 step: a literal when length is zero, a backward
-// reference otherwise.
+// token 是 LZ77 的一步：length 为零时 literal 保存一个字面像素，否则
+// (length, dist) 表示从 dist 个像素之前的位置复制 length 个像素。
+//
+// token is one LZ77 step: a literal when length is zero (literal holds the
+// pixel value), a backward reference otherwise: (length, dist) copies length
+// pixels from dist pixels back.
 type token struct {
 	literal uint32
 	length  int
 	dist    int
 }
 
-// lz77 turns the pixels into literals and backward references.
+// lz77 把像素序列切成字面量与后向引用。哈希表以连续三个像素的混合值索引，
+// 每个位置最多沿冲突链探测 encoderMaxChain 个候选，且匹配长度至少为
+// encoderMinMatch 才成立；被匹配覆盖的每个位置同样入表，让后续位置能够
+// 延续出更长的匹配。
+//
+// lz77 turns the pixels into literals and backward references. The hash table
+// is keyed by a mix of three consecutive pixels; at most encoderMaxChain chain
+// candidates are probed per position and a run needs at least encoderMinMatch
+// pixels to count. Every position covered by a match is inserted as well, so
+// later positions can extend it into a longer match.
 func lz77(pix []uint32) []token {
 	n := len(pix)
 	out := make([]token, 0, n)
@@ -357,8 +438,12 @@ func lz77(pix []uint32) []token {
 	return out
 }
 
-// encodePrefix splits a length or distance value into its prefix code, the
-// extra bits value and the number of extra bits.
+// encodePrefix 把长度或距离值拆成 VP8L 的变长编码：前缀码、附加位数值与
+// 附加位数；v-1 小于 4 时全部落在前缀码内，不带附加位。
+//
+// encodePrefix splits a length or distance value into its VP8L variable length
+// code: the prefix code, the extra bits value and the number of extra bits.
+// Values with v-1 < 4 fit in the prefix alone and carry no extra bits.
 func encodePrefix(v int) (prefix uint32, extra uint32, nbits uint) {
 	e := v - 1
 	if e < 4 {
@@ -373,18 +458,28 @@ func encodePrefix(v int) (prefix uint32, extra uint32, nbits uint) {
 
 /*
 --------------------------------------------------------------------------------------
-Huffman coding
+Huffman coding / Huffman 编码
 --------------------------------------------------------------------------------------
 */
 
-// huffmanCode is a canonical prefix code ready for writing.
+// huffmanCode 是可直接写出的规范前缀码：码长、预计算的规范码字，以及
+// “码表是否只有一个符号”的标记。
+//
+// huffmanCode is a canonical prefix code ready for writing: the code lengths,
+// the precomputed canonical code words, and the flag telling whether the code
+// has a single symbol.
 type huffmanCode struct {
 	lengths []uint32
 	codes   []uint32
+	// single 为真表示码表只有一个符号，写出该符号不消耗比特
 	// single is true when the code has one symbol and therefore costs no bits
 	single bool
 }
 
+// newHuffmanCode 由符号频次构造限长 Huffman 码，并预计算规范码字。
+//
+// newHuffmanCode builds a length-limited Huffman code from the symbol
+// frequencies and precomputes the canonical code words.
 func newHuffmanCode(freq []uint32, limit int) huffmanCode {
 	lengths := buildLengths(freq, limit)
 	codes := canonicalCodes(lengths)
@@ -399,6 +494,12 @@ func newHuffmanCode(freq []uint32, limit int) huffmanCode {
 	return h
 }
 
+// writeSymbol 写出一个符号：码表只有一个符号时（解码端可自行推断）以及
+// 符号越界时（防御性保护）都不写任何比特。
+//
+// writeSymbol writes one symbol; it emits no bits when the code has a single
+// symbol (the decoder can infer it) and when the symbol is out of range (a
+// defensive guard).
 func (e *encoder) writeSymbol(h huffmanCode, sym uint32) {
 	if h.single || int(sym) >= len(h.codes) {
 		return
@@ -406,8 +507,15 @@ func (e *encoder) writeSymbol(h huffmanCode, sym uint32) {
 	e.w.writeCode(h.codes[sym], h.lengths[sym])
 }
 
+// buildLengths 按符号频次构造限长码长：先建最优 Huffman 树并以深度优先
+// 遍历按深度赋予码长，树深超过 limit 时回退到 balancedLengths。频次为零的
+// 符号不分配码长；频次全为零时退化为给符号 0 一个 1 位码。
+//
 // buildLengths returns length limited code lengths for the symbol
-// frequencies. Symbols with a zero frequency get no code.
+// frequencies: it first builds the optimal Huffman tree and assigns the
+// lengths by a depth first walk, falling back to balancedLengths when the tree
+// is deeper than limit. Symbols with a zero frequency get no code; an all-zero
+// frequency vector degenerates to a one-bit code on symbol 0.
 func buildLengths(freq []uint32, limit int) []uint32 {
 	lengths := make([]uint32, len(freq))
 	type leaf struct {
@@ -433,9 +541,9 @@ func buildLengths(freq []uint32, limit int) []uint32 {
 		return lengths
 	}
 
-	// repeatedly merge the two least frequent nodes
+	// 反复合并活动集合中频次最小的两个节点 / repeatedly merge the two least frequent nodes
 	for len(live) > 1 {
-		// find the two smallest
+		// 找出当前频次最小的两个节点 / find the two smallest
 		a, b := 0, 1
 		if nodes[live[b]].freq < nodes[live[a]].freq {
 			a, b = b, a
@@ -451,7 +559,7 @@ func buildLengths(freq []uint32, limit int) []uint32 {
 		na, nb := live[a], live[b]
 		nodes = append(nodes, leaf{freq: nodes[na].freq + nodes[nb].freq, sym: -1, left: na, right: nb})
 		merged := len(nodes) - 1
-		// drop a and b (a is smaller index only by chance)
+		// 从活动集合移除 a、b（a 下标更小纯属巧合）/ drop a and b (a being the smaller index is only by chance)
 		if a > b {
 			a, b = b, a
 		}
@@ -460,7 +568,7 @@ func buildLengths(freq []uint32, limit int) []uint32 {
 		live = append(live, merged)
 	}
 
-	// depth first walk assigns the code lengths
+	// 深度优先遍历按深度赋予码长 / the depth first walk assigns the code lengths
 	var walk func(idx, depth int)
 	maxDepth := 0
 	walk = func(idx, depth int) {
@@ -482,8 +590,14 @@ func buildLengths(freq []uint32, limit int) []uint32 {
 	return lengths
 }
 
-// balancedLengths builds a complete code with lengths limit-1 and limit, used
-// when the optimal tree is deeper than the format allows.
+// balancedLengths 构造只含 limit-1 与 limit 两种码长的完备码，用于最优树
+// 深超过格式上限的情形。频次最高的符号分到较短的码长，两种长度的符号个数
+// 按完备性条件分配。
+//
+// balancedLengths builds a complete code whose lengths are only limit-1 and
+// limit, used when the optimal tree is deeper than the format allows. The most
+// frequent symbols get the shorter length, and the split between the two
+// lengths keeps the code complete.
 func balancedLengths(freq []uint32, limit int) []uint32 {
 	lengths := make([]uint32, len(freq))
 	type symFreq struct {
@@ -507,7 +621,7 @@ func balancedLengths(freq []uint32, limit int) []uint32 {
 	if l < 1 {
 		l = 1
 	}
-	// the most frequent symbols get the shorter code
+	// 频次最高的符号分到较短的码长 / the most frequent symbols get the shorter code
 	for i := 0; i < len(syms); i++ {
 		for j := i + 1; j < len(syms); j++ {
 			if syms[j].freq > syms[i].freq {
@@ -532,7 +646,12 @@ func balancedLengths(freq []uint32, limit int) []uint32 {
 	return lengths
 }
 
-// canonicalCodes assigns the canonical code of every symbol.
+// canonicalCodes 按码长为每个符号分配规范码字：同一码长组内的符号按符号
+// 升序编号，码字连续递增。
+//
+// canonicalCodes assigns the canonical code of every symbol from its length:
+// symbols sharing one length are numbered in ascending symbol order with
+// consecutive code words.
 func canonicalCodes(lengths []uint32) []uint32 {
 	var count [16]uint32
 	for _, l := range lengths {
@@ -556,7 +675,14 @@ func canonicalCodes(lengths []uint32) []uint32 {
 	return codes
 }
 
-// writeHuffmanCode writes one prefix code description.
+// writeHuffmanCode 写出一份前缀码描述：至多两个符号且都小于 256 时走
+// simple code 快速路径；否则以码长码（code length code）对码长做游程
+// 编码后写出完整码表。
+//
+// writeHuffmanCode writes one prefix code description: codes with at most two
+// symbols, all below 256, take the simple code fast path; everything else is
+// written in full, with the code lengths run-length encoded through the code
+// length code.
 func (e *encoder) writeHuffmanCode(h huffmanCode) {
 	count := 0
 	last := 0
@@ -567,7 +693,7 @@ func (e *encoder) writeHuffmanCode(h huffmanCode) {
 		}
 	}
 	if count <= 2 && last < 256 {
-		// simple code: one or two symbols, both below 256
+		// 简单码：一或两个符号且都小于 256 / simple code: one or two symbols, both below 256
 		e.w.writeBits(1, 1)
 		e.w.writeBits(uint32(count-1), 1)
 		first := uint32(0)
@@ -578,7 +704,7 @@ func (e *encoder) writeHuffmanCode(h huffmanCode) {
 			}
 		}
 		if first > 1 {
-			e.w.writeBits(1, 1) // the first symbol needs eight bits
+			e.w.writeBits(1, 1) // 首符号大于 1，需要八位编码 / the first symbol needs eight bits
 			e.w.writeBits(first, 8)
 		} else {
 			e.w.writeBits(0, 1)
@@ -590,7 +716,7 @@ func (e *encoder) writeHuffmanCode(h huffmanCode) {
 		return
 	}
 
-	// normal code: encode the code lengths with the code length code
+	// 普通码：用码长码编码全部码长 / normal code: encode the code lengths with the code length code
 	type clToken struct {
 		sym   uint32
 		extra uint32
@@ -648,12 +774,12 @@ func (e *encoder) writeHuffmanCode(h huffmanCode) {
 	clLengths := buildLengths(clFreq[:], 7)
 	clCodes := canonicalCodes(clLengths)
 
-	e.w.writeBits(0, 1) // normal code
+	e.w.writeBits(0, 1) // 0 = 普通码 / 0 = normal code
 	e.w.writeBits(19-4, 4)
 	for i := 0; i < 19; i++ {
 		e.w.writeBits(clLengths[kCodeLengthCodeOrder[i]], 3)
 	}
-	e.w.writeBits(0, 1) // no explicit max symbol
+	e.w.writeBits(0, 1) // 不写显式最大符号 / no explicit max symbol
 
 	singleCL := true
 	for sym, l := range clLengths {
@@ -673,15 +799,19 @@ func (e *encoder) writeHuffmanCode(h huffmanCode) {
 
 /*
 --------------------------------------------------------------------------------------
-Bit writer
+Bit writer / 比特写入器
 --------------------------------------------------------------------------------------
 */
 
-// encoder collects the output bits.
+// encoder 汇集编码过程产生的全部输出比特。
+//
+// encoder collects the output bits produced during encoding.
 type encoder struct {
 	w bitWriter
 }
 
+// bitWriter 按 VP8L 的要求以最低有效位优先写比特。
+//
 // bitWriter writes bits least significant bit first, as VP8L requires.
 type bitWriter struct {
 	buf  []byte
@@ -689,6 +819,10 @@ type bitWriter struct {
 	n    uint
 }
 
+// writeBits 把 v 的低 n 位按最低有效位优先追加进输出，n 为 0 时什么都不写。
+//
+// writeBits appends the low n bits of v, least significant bit first; n == 0
+// writes nothing.
 func (w *bitWriter) writeBits(v uint32, n uint) {
 	if n == 0 {
 		return
@@ -702,18 +836,29 @@ func (w *bitWriter) writeBits(v uint32, n uint) {
 	}
 }
 
-// writeCode writes a canonical prefix code, most significant bit first.
+// writeCode 按最高有效位优先写出一个 n 位的规范前缀码；码字本身不含长度
+// 信息，长度由所属码表另行描述。
+//
+// writeCode writes an n-bit canonical prefix code, most significant bit first;
+// the code word carries no length of its own, the length comes from the code
+// table it belongs to.
 func (w *bitWriter) writeCode(code uint32, n uint32) {
 	for i := int(n) - 1; i >= 0; i-- {
 		w.writeBits(code>>uint(i)&1, 1)
 	}
 }
 
-// bitPos returns the number of bits written so far.
+// bitPos 返回迄今为止写出的比特总数（含尚未凑满一个字节的余位）。
+//
+// bitPos returns the number of bits written so far, including the trailing
+// bits that do not yet fill a byte.
 func (w *bitWriter) bitPos() int {
 	return len(w.buf)*8 + int(w.n)
 }
 
+// finish 把末尾不足一个字节的余位补零成整字节，并返回输出缓冲区。
+//
+// finish zero-pads the trailing partial byte and returns the output buffer.
 func (w *bitWriter) finish() []byte {
 	if w.n > 0 {
 		w.buf = append(w.buf, byte(w.bits))
