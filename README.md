@@ -158,8 +158,8 @@ Windows/amd64, Ryzen 7 7840HS, `go test -bench . -benchtime 1s`:
 | VP8L lossless decode (320×240) | 3.45 ms (22.3 MP/s) | 2.86 ms (26.9 MP/s) | 1.3–3.4× faster |
 | VP8 lossy decode, YUV only (400×300) | **1.02 ms** (117.8 MP/s) | 1.08 ms (111.4 MP/s) | — |
 | VP8 lossy decode + RGB (400×300) | 4.52 ms → **1.42 ms** (optimized, CT) | not supported | 0.208 ms (single-thread ≈ 6.8× slower) |
-| VP8 lossy encode (400×300) | 4.9 ms (24.6 MP/s) | not supported | — |
-| VP8 lossy encode (640×480) | 11.6 ms (26.4 MP/s) | not supported | — |
+| VP8 lossy encode (400×300) | 8.3 ms (14.4 MP/s) | not supported | — |
+| VP8 lossy encode (640×480) | 21.3 ms (14.4 MP/s) | not supported | — |
 
 > The libwebp column comes from a single thread on a different machine
 > (libwebp 1.5.0 `WebPDecodeRGBA`), scale reference only. Lossy decoding got a
@@ -177,9 +177,12 @@ meta-Huffman / color transform yet).
 - **Lossy encoding is intra only.** The VP8 encoder uses 16x16 luma and 8x8
   chroma modes with a fixed quantizer per frame, no 4x4 modes, no loop filter
   and no rate control. Output is a valid stream any VP8 decoder accepts, but at
-  matched PSNR the files come out about 1.7-1.9x the size `cwebp` 1.5.0 produces
+  matched PSNR the files come out about 1.3-1.5x the size `cwebp` 1.5.0 produces
   (measured on a 320x240 photo), since the 4x4 modes, the loop filter and the
   rate-distortion optimisation are all missing
+- Lossy encoding runs twice: the first pass collects token statistics and the
+  second encodes with probabilities adapted to them, which costs about 1.8x the
+  time of a single pass
 - The encoder implements neither color transform nor meta-Huffman blocked
   coding, so compression is weaker than `cwebp`
 - `ALPH` `preprocessing=1` (level reduction) is passed through as-is, without

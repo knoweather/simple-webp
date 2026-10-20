@@ -1,6 +1,9 @@
 package vp8
 
-import "image"
+import (
+	"image"
+	"math"
+)
 
 // 帧内编码器：只使用 16x16 亮度模式与 8x8 色度模式，量化索引固定，环路滤波
 // 关闭（滤波强度 0 时规范允许省略滤波）。
@@ -22,6 +25,13 @@ type encoder struct {
 	tok                boolEncoder
 	levels             [400]int32
 	qi                 int
+	// counts 记录每个 token 概率条目上取 0 与取 1 的次数，用于把默认概率表
+	// 调整成贴合本帧统计的表。
+	//
+	// counts tallies the zero and one decisions at every token probability
+	// entry, so the default table can be adapted to this frame's statistics.
+	counts  [nPlane][nBand][nContext][nProb][2]uint32
+	collect bool
 }
 
 // maxCoeffLevel 是系数幅值的上限：CAT6 覆盖到 67+2047，再大就只能截断。
@@ -162,16 +172,27 @@ func (e *encoder) loadSource(src *image.YCbCr) {
 // header, the first partition (control header and macroblock modes) and the
 // single residual partition.
 func (e *encoder) run() []byte {
-	d := &e.d
-	e.writeHeader()
-	for mby := 0; mby < d.mbh; mby++ {
-		d.leftMB = mbState{}
-		for mbx := 0; mbx < d.mbw; mbx++ {
-			e.encodeMB(mbx, mby)
-		}
-		d.y.fillOverhang(mby*16 + 15)
-	}
+	// 第一遍只统计每个 token 概率条目上的 0/1 次数，不产出字节；据此把默认
+	// 概率表调整成本帧自己的统计，第二遍用调整后的表真正编码。模式决策与量化
+	// 都与概率无关，所以两遍得到完全相同的系数与重建。
+	//
+	// The first pass only tallies the zero and one decisions at every token
+	// probability entry and emits nothing; the default table is then adapted to
+	// this frame's own statistics and the second pass encodes with it. Mode
+	// decisions and quantisation do not depend on the probabilities, so both
+	// passes produce the same coefficients and the same reconstruction.
+	e.collect, e.hdr.dry, e.tok.dry = true, true, true
+	e.encodeAll()
+	e.d.tokenProb = e.adaptTokenProb()
 
+	e.collect, e.hdr.dry, e.tok.dry = false, false, false
+	e.hdr.init()
+	e.tok.init()
+	e.resetReconstruction()
+	e.writeHeader()
+	e.encodeAll()
+
+	d := &e.d
 	hdr := e.hdr.finish()
 	tok := e.tok.finish()
 	out := make([]byte, 0, 10+len(hdr)+len(tok))
@@ -182,6 +203,98 @@ func (e *encoder) run() []byte {
 	out = append(out, tok...)
 	return out
 }
+
+// encodeAll 按光栅顺序编码全部宏块。
+//
+// encodeAll codes every macroblock in raster order.
+func (e *encoder) encodeAll() {
+	d := &e.d
+	for mby := 0; mby < d.mbh; mby++ {
+		d.leftMB = mbState{}
+		for mbx := 0; mbx < d.mbw; mbx++ {
+			e.encodeMB(mbx, mby)
+		}
+		d.y.fillOverhang(mby*16 + 15)
+	}
+}
+
+// resetReconstruction 把重建平面与宏块状态清空，供第二遍重新编码。
+//
+// resetReconstruction clears the reconstruction planes and the macroblock state
+// so the second pass can start over.
+func (e *encoder) resetReconstruction() {
+	d := &e.d
+	d.y = newPlane(d.mbw*16, d.mbh*16, 4)
+	d.cb = newPlane(d.mbw*8, d.mbh*8, 0)
+	d.cr = newPlane(d.mbw*8, d.mbh*8, 0)
+	d.y.initBorders()
+	d.cb.initBorders()
+	d.cr.initBorders()
+	d.upMB = make([]mbState, d.mbw)
+	d.leftMB = mbState{}
+}
+
+// adaptTokenProb 依据第一遍的统计把默认概率表调整成本帧的概率表。
+//
+// adaptTokenProb turns the default table into this frame's table using the first
+// pass tallies.
+//
+// 每个条目取使编码代价最小的概率，但只有省下的位数明显超过传输新值的成本时
+// 才真的改写：写出一个概率约需八位数值加几位更新标志。样本太少的条目保留默认。
+//
+// Each entry takes the probability that codes this frame's decisions cheapest,
+// but is only rewritten when the bits it saves clearly outweigh the cost of
+// transmitting the new value: about eight bits for the value plus a few for the
+// update flag. Entries with too few samples keep their default.
+func (e *encoder) adaptTokenProb() [nPlane][nBand][nContext][nProb]uint8 {
+	table := defaultTokenProb
+	for i := range e.counts {
+		for j := range e.counts[i] {
+			for k := range e.counts[i][j] {
+				for l := range e.counts[i][j][k] {
+					c0 := uint64(e.counts[i][j][k][l][0])
+					c1 := uint64(e.counts[i][j][k][l][1])
+					n := c0 + c1
+					if n < minAdaptSamples {
+						continue
+					}
+					p := uint8((c0*255 + n/2) / n)
+					if p < 1 {
+						p = 1
+					}
+					def := defaultTokenProb[i][j][k][l]
+					if p == def {
+						continue
+					}
+					if tokenCost(c0, c1, def)-tokenCost(c0, c1, p) <= minAdaptGainBits {
+						continue
+					}
+					table[i][j][k][l] = p
+				}
+			}
+		}
+	}
+	return table
+}
+
+// tokenCost 返回用 prob 作零概率编码 c0 个零与 c1 个一时所需的位数。
+//
+// tokenCost returns the bits needed to code c0 zeros and c1 ones with prob as
+// the probability of a zero.
+func tokenCost(c0, c1 uint64, prob uint8) float64 {
+	p := float64(prob) / 256
+	return -float64(c0)*math.Log2(p) - float64(c1)*math.Log2(1-p)
+}
+
+// minAdaptSamples 是改写一个概率条目所需的最少样本数，minAdaptGainBits 是
+// 所需的最小净收益（比特）。
+//
+// minAdaptSamples is the least number of samples needed to rewrite a
+// probability entry and minAdaptGainBits the least net gain in bits.
+const (
+	minAdaptSamples  = 16
+	minAdaptGainBits = 12.0
+)
 
 // writeHeader 写出首分区里的控制头：色彩标志、分段、滤波、分区数、量化、
 // token 概率更新与 skip 概率。
@@ -216,13 +329,21 @@ func (e *encoder) writeHeader() {
 	// 不刷新熵概率（单帧无影响）。
 	// no entropy refresh (irrelevant for a single frame).
 	h.putBit(uniformProb, false)
-	// 全部 token 概率沿用默认表。
-	// every token probability keeps its default value.
+	// token 概率更新：与默认表不同的条目才写出新值。
+	// token probability updates: only the entries that differ from the default
+	// table carry a new value.
 	for i := range tokenUpdateProb {
 		for j := range tokenUpdateProb[i] {
 			for k := range tokenUpdateProb[i][j] {
 				for l := range tokenUpdateProb[i][j][k] {
-					h.putBit(tokenUpdateProb[i][j][k][l], false)
+					up := tokenUpdateProb[i][j][k][l]
+					p := e.d.tokenProb[i][j][k][l]
+					if p == defaultTokenProb[i][j][k][l] {
+						h.putBit(up, false)
+						continue
+					}
+					h.putBit(up, true)
+					h.putUint(uniformProb, 8, uint32(p))
 				}
 			}
 		}
@@ -538,13 +659,11 @@ func (e *encoder) writeTokens(mbx int) {
 // it has a non-zero coefficient. With skipDC the DC is skipped, as for the luma
 // blocks of a Y16 macroblock whose DC lives in the Y2 block.
 func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
-	enc := &e.tok
-	prob := &e.d.tokenProb[plane]
 	n := 0
 	if skipDC {
 		n = 1
 	}
-	p := prob[coeffBands[n]][ctx]
+	pBand, pCtx := int(coeffBands[n]), ctx
 
 	// 最后一个非零系数的扫描位置，用于决定何处写 EOB。
 	// scan position of the last non-zero coefficient, which decides where the
@@ -556,20 +675,20 @@ func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
 		}
 	}
 	if last == n {
-		enc.putBit(p[0], false)
+		e.putToken(plane, pBand, pCtx, 0, false)
 		return 0
 	}
-	enc.putBit(p[0], true)
+	e.putToken(plane, pBand, pCtx, 0, true)
 
 	for n < 16 {
 		n++
 		v := e.levels[base+int(zigzag[n-1])]
 		if v == 0 {
-			enc.putBit(p[1], false)
-			p = prob[coeffBands[n]][0]
+			e.putToken(plane, pBand, pCtx, 1, false)
+			pBand, pCtx = int(coeffBands[n]), 0
 			continue
 		}
-		enc.putBit(p[1], true)
+		e.putToken(plane, pBand, pCtx, 1, true)
 		mag := v
 		if mag < 0 {
 			mag = -mag
@@ -577,30 +696,30 @@ func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
 		ctx2 := 2
 		switch {
 		case mag == 1:
-			enc.putBit(p[2], false)
+			e.putToken(plane, pBand, pCtx, 2, false)
 			ctx2 = 1
 		case mag == 2:
-			enc.putBit(p[2], true)
-			enc.putBit(p[3], false)
-			enc.putBit(p[4], false)
+			e.putToken(plane, pBand, pCtx, 2, true)
+			e.putToken(plane, pBand, pCtx, 3, false)
+			e.putToken(plane, pBand, pCtx, 4, false)
 		case mag <= 4:
-			enc.putBit(p[2], true)
-			enc.putBit(p[3], false)
-			enc.putBit(p[4], true)
-			enc.putUint(p[5], 1, uint32(mag-3))
+			e.putToken(plane, pBand, pCtx, 2, true)
+			e.putToken(plane, pBand, pCtx, 3, false)
+			e.putToken(plane, pBand, pCtx, 4, true)
+			e.putToken(plane, pBand, pCtx, 5, mag-3 == 1)
 		case mag <= 6:
-			enc.putBit(p[2], true)
-			enc.putBit(p[3], true)
-			enc.putBit(p[6], false)
-			enc.putBit(p[7], false)
-			enc.putUint(159, 1, uint32(mag-5))
+			e.putToken(plane, pBand, pCtx, 2, true)
+			e.putToken(plane, pBand, pCtx, 3, true)
+			e.putToken(plane, pBand, pCtx, 6, false)
+			e.putToken(plane, pBand, pCtx, 7, false)
+			e.tok.putBit(159, mag-5 == 1)
 		case mag <= 10:
-			enc.putBit(p[2], true)
-			enc.putBit(p[3], true)
-			enc.putBit(p[6], false)
-			enc.putBit(p[7], true)
-			enc.putUint(165, 1, uint32((mag-7)>>1))
-			enc.putUint(145, 1, uint32((mag-7)&1))
+			e.putToken(plane, pBand, pCtx, 2, true)
+			e.putToken(plane, pBand, pCtx, 3, true)
+			e.putToken(plane, pBand, pCtx, 6, false)
+			e.putToken(plane, pBand, pCtx, 7, true)
+			e.tok.putBit(165, (mag-7)>>1 == 1)
+			e.tok.putBit(145, (mag-7)&1 == 1)
 		default:
 			cat, baseMag, nbits := 0, int32(11), 3
 			switch {
@@ -612,30 +731,46 @@ func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
 			default:
 				cat, baseMag, nbits = 3, 67, 11
 			}
-			enc.putBit(p[2], true)
-			enc.putBit(p[3], true)
-			enc.putBit(p[6], true)
+			e.putToken(plane, pBand, pCtx, 2, true)
+			e.putToken(plane, pBand, pCtx, 3, true)
+			e.putToken(plane, pBand, pCtx, 6, true)
 			b1 := cat >> 1
-			enc.putUint(p[8], 1, uint32(b1))
-			enc.putUint(p[9+b1], 1, uint32(cat&1))
+			e.putToken(plane, pBand, pCtx, 8, b1 == 1)
+			e.putToken(plane, pBand, pCtx, 9+b1, cat&1 == 1)
 			extra := uint32(mag - baseMag)
 			for i := 0; i < nbits; i++ {
-				enc.putBit(cat3456[cat][i], extra>>uint(nbits-1-i)&1 != 0)
+				e.tok.putBit(cat3456[cat][i], extra>>uint(nbits-1-i)&1 != 0)
 			}
 		}
-		p = prob[coeffBands[n]][ctx2]
-		enc.putBit(uniformProb, v < 0)
+		pBand, pCtx = int(coeffBands[n]), ctx2
+		e.tok.putBit(uniformProb, v < 0)
 
 		if n == 16 {
 			break
 		}
 		more := n < last
-		enc.putBit(p[0], more)
+		e.putToken(plane, pBand, pCtx, 0, more)
 		if !more {
 			break
 		}
 	}
 	return 1
+}
+
+// putToken 统计并写出一个 token 树节点的判决。概率取自当前帧的概率表，因此
+// 第二遍会自动用上调整后的值。
+//
+// putToken tallies and emits one token tree decision. The probability comes from
+// the current frame's table, so the second pass picks up the adapted values.
+func (e *encoder) putToken(plane, band, ctx, node int, bit bool) {
+	if e.collect {
+		var b int
+		if bit {
+			b = 1
+		}
+		e.counts[plane][band][ctx][node][b]++
+	}
+	e.tok.putBit(e.d.tokenProb[plane][band][ctx][node], bit)
 }
 
 // sadPlane 返回 n x n 块内预测与源的绝对差之和。

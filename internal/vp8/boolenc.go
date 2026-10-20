@@ -29,6 +29,10 @@ type boolEncoder struct {
 	rng   uint32 // [1, 255]
 	count int    // 距上次定稿累积的位数，初值 -24 / bits since the last byte, starts at -24
 	buf   []byte
+	// dry 为真时只走状态机而不产出字节，用于统计遍。
+	// dry runs the state machine without producing bytes, for the statistics
+	// pass.
+	dry bool
 }
 
 // init 复位编码器。range 与解码器一致取 255（即 rngM1=254），窗口为空。
@@ -46,6 +50,9 @@ func (e *boolEncoder) init() {
 //
 // putBit encodes one bit with prob as the probability of a zero.
 func (e *boolEncoder) putBit(prob uint8, bit bool) {
+	if e.dry {
+		return
+	}
 	split := 1 + (e.rng-1)*uint32(prob)>>8
 	rng := split
 	low := e.low
