@@ -177,7 +177,7 @@ meta-Huffman / color transform yet).
 - **Lossy encoding is intra only.** The VP8 encoder uses 16x16 luma and 8x8
   chroma modes with a fixed quantizer per frame, no 4x4 modes, no loop filter
   and no rate control. Output is a valid stream any VP8 decoder accepts, but at
-  matched PSNR the files come out about 1.3-1.5x the size `cwebp` 1.5.0 produces
+  matched PSNR the files come out about 1.2-1.4x the size `cwebp` 1.5.0 produces
   (measured on a 320x240 photo), since the 4x4 modes, the loop filter and the
   rate-distortion optimisation are all missing
 - Lossy encoding runs twice: the first pass collects token statistics and the
