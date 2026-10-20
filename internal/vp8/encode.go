@@ -5,12 +5,18 @@ import (
 	"math"
 )
 
-// 帧内编码器：只使用 16x16 亮度模式与 8x8 色度模式，量化索引固定，环路滤波
-// 关闭（滤波强度 0 时规范允许省略滤波）。
+// 帧内编码器：亮度可以用整块 16x16 模式，也可以用十六个 4x4 模式；色度用
+// 8x8 模式。量化索引固定，环路滤波关闭（滤波强度 0 时规范允许省略滤波）。
+// 模式由率失真准则选出：每个候选模式都要走一遍预测、变换与量化，再用
+// 「重建失真 + 系数 × 比特数」比较。
 //
-// The intra frame encoder: 16x16 luma and 8x8 chroma modes only, one fixed
-// quantization index and the loop filter disabled (a filter level of zero lets
-// the decoder skip filtering entirely).
+// The intra frame encoder: luma uses either one 16x16 mode or sixteen 4x4
+// modes, chroma uses 8x8 modes. One fixed quantization index and the loop
+// filter disabled (a filter level of zero lets the decoder skip filtering
+// entirely). The modes are picked by a rate distortion criterion: every
+// candidate mode goes through prediction, transform and quantization, and the
+// candidates are compared on "reconstruction distortion plus lambda times the
+// number of bits".
 //
 // 重建直接复用解码器：预测与逆变换跑的是同一份代码，所以编码端维护的参考
 // 像素与解码端逐位一致，后续宏块的预测不会漂移。
@@ -23,15 +29,65 @@ type encoder struct {
 	srcY, srcCb, srcCr *plane
 	hdr                boolEncoder
 	tok                boolEncoder
-	levels             [400]int32
-	qi                 int
+	// cost 只用来累计比特数，不产出字节：率失真决策要比较候选模式的码长。
+	//
+	// cost only tallies the number of bits and produces no bytes: the rate
+	// distortion decisions compare the length of the candidate modes.
+	cost boolEncoder
+	// levels 是当前宏块的量化系数，candLevels 是评估候选模式时的暂存。
+	//
+	// levels holds the quantized coefficients of the current macroblock and
+	// candLevels the scratch space for a candidate mode.
+	levels     [400]int32
+	candLevels [400]int32
+	// predY4 是选中的十六个 4x4 亮度模式。
+	//
+	// predY4 holds the sixteen chosen 4x4 luma modes.
+	predY4 [4][4]uint8
+	qi     int
+	// y4Blocks 统计走了 4x4 模式那条路的宏块数，供测试确认这条路真的被走到。
+	//
+	// y4Blocks counts the macroblocks that took the 4x4 mode path, so the tests
+	// can confirm the path is really taken.
+	y4Blocks int
+	// decisions 缓存每个宏块选中的模式，第二遍编码直接照着写。
+	//
+	// decisions caches the modes chosen for every macroblock so the second
+	// pass writes them as they are.
+	decisions []mbDecision
+	// replay 为真时不再搜索模式，直接用 decisions 里记录的。
+	//
+	// replay skips the mode search and uses the recorded decisions.
+	replay bool
 	// counts 记录每个 token 概率条目上取 0 与取 1 的次数，用于把默认概率表
 	// 调整成贴合本帧统计的表。
 	//
 	// counts tallies the zero and one decisions at every token probability
 	// entry, so the default table can be adapted to this frame's statistics.
-	counts  [nPlane][nBand][nContext][nProb][2]uint32
-	collect bool
+	counts [nPlane][nBand][nContext][nProb][2]uint32
+	// collect 为真时统计 token 的取值分布；estimating 为真时写出的比特只
+	// 计入代价而不落到码流里。
+	//
+	// collect tallies the token decisions and estimating routes the bits into
+	// the cost accumulator instead of the stream.
+	collect    bool
+	estimating bool
+	// rdScale 是率失真权衡系数的倍率。
+	//
+	// rdScale scales the rate distortion trade-off factor.
+	rdScale float64
+}
+
+// mbDecision 记录一个宏块选中的模式：16x16 与 4x4 两条路各记一套，外加色度
+// 模式。
+//
+// mbDecision records the modes chosen for one macroblock: one set for the 16x16
+// path and one for the 4x4 path, plus the chroma mode.
+type mbDecision struct {
+	useY16  bool
+	predY16 uint8
+	predC8  uint8
+	predY4  [4][4]uint8
 }
 
 // quantBiasNum 是量化取整偏置的百分数。50 是四舍五入，取 40 会略偏向零：靠近
@@ -66,6 +122,15 @@ const (
 // Encode codes a 4:2:0 YCbCr image as a VP8 key frame. quality runs from 0
 // (smallest) to 100 (best).
 func Encode(src *image.YCbCr, quality int) ([]byte, error) {
+	return EncodeWithScale(src, quality, rdScaleDefault)
+}
+
+// EncodeWithScale 与 Encode 相同，但把率失真权衡系数乘上给定的倍率；倍率零
+// 表示用默认值。
+//
+// EncodeWithScale is Encode with the rate distortion trade-off factor scaled
+// by the given factor; a factor of zero means the default.
+func EncodeWithScale(src *image.YCbCr, quality int, scale float64) ([]byte, error) {
 	if src.SubsampleRatio != image.YCbCrSubsampleRatio420 {
 		return nil, ErrInvalid
 	}
@@ -74,6 +139,9 @@ func Encode(src *image.YCbCr, quality int) ([]byte, error) {
 		return nil, ErrInvalid
 	}
 	e := newEncoder(w, h, src, quality)
+	if scale > 0 {
+		e.rdScale = scale
+	}
 	return e.run(), nil
 }
 
@@ -108,6 +176,7 @@ func newEncoder(w, h int, src *image.YCbCr, quality int) *encoder {
 	d.skipProb = uniformProb
 
 	e.qi = quantIndex(quality)
+	e.rdScale = rdScaleDefault
 	q := e.qi
 	d.q[0].y1[0] = dequantTableDC[q]
 	d.q[0].y1[1] = dequantTableAC[q]
@@ -123,9 +192,11 @@ func newEncoder(w, h int, src *image.YCbCr, quality int) *encoder {
 	e.srcCb = newPlane(d.mbw*8, d.mbh*8, 0)
 	e.srcCr = newPlane(d.mbw*8, d.mbh*8, 0)
 	e.loadSource(src)
+	e.decisions = make([]mbDecision, d.mbw*d.mbh)
 
 	e.hdr.init()
 	e.tok.init()
+	e.cost.costMode = true
 	return e
 }
 
@@ -193,10 +264,15 @@ func (e *encoder) run() []byte {
 	// decisions and quantisation do not depend on the probabilities, so both
 	// passes produce the same coefficients and the same reconstruction.
 	e.collect, e.hdr.dry, e.tok.dry = true, true, true
+	e.replay = false
 	e.encodeAll()
 	e.d.tokenProb = e.adaptTokenProb()
 
+	// 第二遍沿用第一遍选好的模式：模式搜索是最贵的一步，没有必要做两遍。
+	// The second pass reuses the modes chosen by the first one: the mode search
+	// is the most expensive step and there is no need to do it twice.
 	e.collect, e.hdr.dry, e.tok.dry = false, false, false
+	e.replay = true
 	e.hdr.init()
 	e.tok.init()
 	e.resetReconstruction()
@@ -363,109 +439,149 @@ func (e *encoder) writeHeader() {
 	h.putUint(uniformProb, 8, uint32(e.d.skipProb))
 }
 
-// encodeMB 编码一个宏块：选模式、变换量化、写模式位与残差 token、再重建。
+// encodeMB 编码一个宏块：按率失真准则选模式、变换量化、写模式位与残差
+// token、再重建。
 //
-// encodeMB codes one macroblock: mode selection, transform and quantization,
-// the mode bits and residual tokens, then reconstruction.
+// encodeMB codes one macroblock: it picks the modes by the rate distortion
+// criterion, transforms and quantizes, writes the mode bits and the residual
+// tokens, then reconstructs.
 func (e *encoder) encodeMB(mbx, mby int) {
 	d := &e.d
 	bx, by := mbx*16, mby*16
 	cx, cy := mbx*8, mby*8
 
-	bestY := uint8(predDC)
-	bestCost := 1 << 30
-	for _, m := range [4]uint8{predDC, predVE, predHE, predTM} {
-		d.predict16(checkTopLeftPred(mbx, mby, m), bx, by)
-		if c := sadPlane(d.y, e.srcY, bx, by, 16); c < bestCost {
-			bestCost, bestY = c, m
+	// 宏块最右 4x4 块的右上预测像素取自宏块上方那一行，必须在预测之前取好。
+	// The top right pixels of the rightmost 4x4 block come from the row above
+	// the macroblock, so they have to be fetched before the prediction.
+	d.loadTopRight(mbx, mby)
+
+	if e.replay {
+		// 第二遍沿用第一遍的决策，不再搜索模式。
+		// The second pass reuses the decisions of the first pass and searches
+		// no modes again.
+		dec := &e.decisions[mby*d.mbw+mbx]
+		d.usePredY16 = dec.useY16
+		d.predY16 = dec.predY16
+		d.predC8 = dec.predC8
+		d.predY4 = dec.predY4
+	} else {
+		// 色度模式与亮度模式互不依赖，先定色度。
+		// The chroma mode does not depend on the luma mode, so it comes first.
+		bestC := e.chooseChromaMode(mbx, mby, cx, cy)
+		// 亮度：整块 16x16 与十六个 4x4 两条路里选代价更低的一条。
+		// Luma: pick the cheaper of one 16x16 mode and sixteen 4x4 modes.
+		useY16, bestY := e.chooseLumaMode(mbx, mby, bx, by)
+		d.usePredY16 = useY16
+		d.predY16 = bestY
+		d.predC8 = bestC
+		d.predY4 = e.predY4
+		e.decisions[mby*d.mbw+mbx] = mbDecision{
+			useY16:  useY16,
+			predY16: bestY,
+			predC8:  bestC,
+			predY4:  e.predY4,
 		}
 	}
 
-	bestC := uint8(predDC)
-	bestCost = 1 << 30
-	for _, m := range [4]uint8{predDC, predVE, predHE, predTM} {
-		cm := checkTopLeftPred(mbx, mby, m)
-		d.predict8(d.cb, cm, cx, cy)
-		d.predict8(d.cr, cm, cx, cy)
-		c := sadPlane(d.cb, e.srcCb, cx, cy, 8) + sadPlane(d.cr, e.srcCr, cx, cy, 8)
-		if c < bestCost {
-			bestCost, bestC = c, m
-		}
-	}
+	// 用选中的模式算出系数并重建像素。
+	// Compute the coefficients with the chosen modes and reconstruct.
+	e.buildMacroblock(mbx, mby, bx, by, cx, cy)
 
-	d.usePredY16 = true
-	d.predY16 = bestY
-	d.predC8 = bestC
-	d.predict16(checkTopLeftPred(mbx, mby, bestY), bx, by)
-	cm := checkTopLeftPred(mbx, mby, bestC)
-	d.predict8(d.cb, cm, cx, cy)
-	d.predict8(d.cr, cm, cx, cy)
-
-	skip := e.transformMB(bx, by, cx, cy)
+	skip := e.levelsAreZero()
 
 	if d.useSkipProb {
 		e.hdr.putBit(d.skipProb, skip)
 	}
-	e.hdr.putBit(145, true)
-	switch bestY {
-	case predDC:
-		e.hdr.putBit(156, false)
-		e.hdr.putBit(163, false)
-	case predVE:
-		e.hdr.putBit(156, false)
-		e.hdr.putBit(163, true)
-	case predHE:
-		e.hdr.putBit(156, true)
-		e.hdr.putBit(128, false)
-	default:
-		e.hdr.putBit(156, true)
-		e.hdr.putBit(128, true)
+	if d.usePredY16 {
+		e.hdr.putBit(145, true)
+		writeY16Mode(&e.hdr, d.predY16)
+		for i := 0; i < 4; i++ {
+			d.upMB[mbx].pred[i] = d.predY16
+			d.leftMB.pred[i] = d.predY16
+		}
+	} else {
+		e.hdr.putBit(145, false)
+		e.writeY4Modes(mbx)
 	}
-	switch bestC {
-	case predDC:
-		e.hdr.putBit(142, false)
-	case predVE:
-		e.hdr.putBit(142, true)
-		e.hdr.putBit(114, false)
-	case predHE:
-		e.hdr.putBit(142, true)
-		e.hdr.putBit(114, true)
-		e.hdr.putBit(183, false)
-	default:
-		e.hdr.putBit(142, true)
-		e.hdr.putBit(114, true)
-		e.hdr.putBit(183, true)
-	}
+	writeChromaMode(&e.hdr, d.predC8)
 
-	e.loadCoeffs()
 	if !skip {
 		e.writeTokens(mbx)
 	} else {
-		d.leftMB.nzY16 = 0
-		d.upMB[mbx].nzY16 = 0
+		if d.usePredY16 {
+			d.leftMB.nzY16 = 0
+			d.upMB[mbx].nzY16 = 0
+		}
 		d.leftMB.nzMask = 0
 		d.upMB[mbx].nzMask = 0
 	}
-	e.setMasks()
-	d.reconstructMacroblock(mbx, mby)
 }
 
-// transformMB 对宏块做残差、正变换与量化，结果留在 e.levels 中；全部为零时
-// 返回 true，表示该宏块可以只做预测。
+// buildMacroblock 用选中的模式算出宏块的残差系数并重建像素：亮度按整块
+// 16x16 或十六个 4x4 块，色度按 8x8。
 //
-// transformMB computes the residual, the forward transforms and quantization
-// into e.levels; it returns true when everything quantized to zero, meaning the
-// macroblock needs prediction only.
-func (e *encoder) transformMB(bx, by, cx, cy int) bool {
+// buildMacroblock computes the residual coefficients of a macroblock with the
+// chosen modes and reconstructs the pixels: the luma either as one 16x16 block
+// or as sixteen 4x4 blocks, the chroma as 8x8 blocks.
+func (e *encoder) buildMacroblock(mbx, mby, bx, by, cx, cy int) {
+	d := &e.d
+	if d.usePredY16 {
+		d.predict16(checkTopLeftPred(mbx, mby, d.predY16), bx, by)
+		e.transformLuma16(bx, by)
+		e.loadCoeffsLuma16()
+		e.setMasksLuma16()
+		e.reconstructLuma16(mbx, mby)
+	} else {
+		// 4x4 模式下没有 Y2 块，那一段系数必须清零，否则 skip 判断会看错。
+		// The 4x4 path has no Y2 block, so those coefficients have to be cleared
+		// or the skip test would look at stale values.
+		for i := 384; i < 400; i++ {
+			e.levels[i] = 0
+		}
+		for j := 0; j < 4; j++ {
+			for i := 0; i < 4; i++ {
+				n := 4*j + i
+				x, y := bx+i*4, by+j*4
+				d.predict4(d.predY4[j][i], x, y)
+				e.transformLuma4(n, x, y)
+				e.loadCoeffsLuma4(n)
+				e.setMasksLuma4(n)
+				d.addResidual4(x, y, n)
+			}
+		}
+	}
+	cm := checkTopLeftPred(mbx, mby, d.predC8)
+	d.predict8(d.cb, cm, cx, cy)
+	d.predict8(d.cr, cm, cx, cy)
+	e.transformChroma(cx, cy)
+	e.loadCoeffsChroma()
+	e.setMasksChroma()
+	e.reconstructChroma(mbx, mby)
+}
+
+// levelsAreZero 报告当前宏块的系数是否全为零，也就是可以只做预测。
+//
+// levelsAreZero reports whether every coefficient of the macroblock
+// quantized to zero, meaning the macroblock needs prediction only.
+func (e *encoder) levelsAreZero() bool {
+	for _, v := range e.levels {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// transformLuma16 对 16x16 亮度块做残差、正变换与量化，结果留在 e.levels 中：
+// 16 个 4x4 块只保留 AC，DC 汇总进 Y2 做 Walsh-Hadamard。
+//
+// transformLuma16 computes the residual, the forward transforms and the
+// quantization of a 16x16 luma block into e.levels: the sixteen 4x4 blocks keep
+// their AC only, the DC values feed the Walsh-Hadamard transform of the Y2
+// block.
+func (e *encoder) transformLuma16(bx, by int) {
 	d := &e.d
 	q := d.q[0]
-	for i := range e.levels {
-		e.levels[i] = 0
-	}
-
-	// 亮度：16 个 4x4 块只保留 AC，DC 汇总进 Y2 做 Walsh-Hadamard。
-	// luma: the sixteen 4x4 blocks keep their AC only, the DC values feed the
-	// Walsh-Hadamard transform of the Y2 block.
 	var dc [16]int32
 	for n := 0; n < 16; n++ {
 		x, y := bx+(n%4)*4, by+(n/4)*4
@@ -473,6 +589,7 @@ func (e *encoder) transformMB(bx, by, cx, cy int) bool {
 		e.residual(d.y, e.srcY, x, y, &blk)
 		fdct4x4(&blk)
 		dc[n] = blk[0]
+		e.levels[16*n] = 0
 		for z := 1; z < 16; z++ {
 			e.levels[16*n+z] = quantize(blk[z], q.y1[1])
 		}
@@ -485,10 +602,38 @@ func (e *encoder) transformMB(bx, by, cx, cy int) bool {
 		}
 		e.levels[384+i] = quantize(dc[i], qq)
 	}
+}
 
-	// 色度：Cb 的四个块在前，Cr 的四个块在后，全部系数都编码。
-	// chroma: the four Cb blocks then the four Cr blocks, every coefficient
-	// coded.
+// transformLuma4 对一个 4x4 亮度块做残差、正变换与量化，结果留在 e.levels
+// 的第 n 块里：DC 与 AC 都留在块内，不经过 Y2。
+//
+// transformLuma4 computes the residual, the forward transform and the
+// quantization of one 4x4 luma block into the n-th block of e.levels: the DC
+// and the AC stay in the block, no Y2 is involved.
+func (e *encoder) transformLuma4(n, x, y int) {
+	d := &e.d
+	q := d.q[0]
+	var blk [16]int32
+	e.residual(d.y, e.srcY, x, y, &blk)
+	fdct4x4(&blk)
+	for z := 0; z < 16; z++ {
+		qq := q.y1[1]
+		if z == 0 {
+			qq = q.y1[0]
+		}
+		e.levels[16*n+z] = quantize(blk[z], qq)
+	}
+}
+
+// transformChroma 对色度做残差、正变换与量化：Cb 的四个块在前，Cr 的四个块
+// 在后，全部系数都编码。
+//
+// transformChroma computes the residual, the forward transforms and the
+// quantization of the chroma: the four Cb blocks come first, then the four Cr
+// blocks, and every coefficient is coded.
+func (e *encoder) transformChroma(cx, cy int) {
+	d := &e.d
+	q := d.q[0]
 	for c := 0; c < 4; c++ {
 		x, y := cx+(c%2)*4, cy+(c/2)*4
 		var blk [16]int32
@@ -511,13 +656,6 @@ func (e *encoder) transformMB(bx, by, cx, cy int) bool {
 			e.levels[320+16*c+z] = quantize(blk[z], qq)
 		}
 	}
-
-	for _, v := range e.levels {
-		if v != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 // residual 取预测平面与源平面之差。
@@ -533,18 +671,37 @@ func (e *encoder) residual(pred, src *plane, x, y int, out *[16]int32) {
 	}
 }
 
-// loadCoeffs 把量化后的系数反量化进解码器的系数缓冲，Y2 走逆 WHT 分散到
-// 16 个亮度块。
+// loadCoeffs 把当前宏块的系数全部反量化进解码器的系数缓冲：16x16 模式下
+// Y2 走逆 WHT 分散到 16 个亮度块，4x4 模式下每个亮度块自带 DC。
 //
-// loadCoeffs dequantizes the levels into the decoder's coefficient buffer; the
-// Y2 block goes through the inverse Walsh-Hadamard transform, which scatters the
-// DC values into the sixteen luma blocks.
+// loadCoeffs dequantizes the levels of the current macroblock into the
+// decoder's coefficient buffer: with a 16x16 mode the Y2 block goes through the
+// inverse Walsh-Hadamard transform, which scatters the DC values into the
+// sixteen luma blocks, with 4x4 modes every luma block carries its own DC.
 func (e *encoder) loadCoeffs() {
 	d := &e.d
-	q := d.q[0]
 	for i := range d.coeff {
 		d.coeff[i] = 0
 	}
+	if d.usePredY16 {
+		e.loadCoeffsLuma16()
+	} else {
+		for n := 0; n < 16; n++ {
+			e.loadCoeffsLuma4(n)
+		}
+	}
+	e.loadCoeffsChroma()
+}
+
+// loadCoeffsLuma16 把 Y2 与亮度块的系数反量化进解码器的系数缓冲，Y2 走逆 WHT
+// 分散到 16 个亮度块。
+//
+// loadCoeffsLuma16 dequantizes the Y2 and luma levels into the decoder's
+// coefficient buffer; the Y2 block goes through the inverse Walsh-Hadamard
+// transform, which scatters the DC values into the sixteen luma blocks.
+func (e *encoder) loadCoeffsLuma16() {
+	d := &e.d
+	q := d.q[0]
 	for i := 0; i < 16; i++ {
 		qq := q.y2[1]
 		if i == 0 {
@@ -558,6 +715,31 @@ func (e *encoder) loadCoeffs() {
 			d.coeff[16*n+z] = int16(e.levels[16*n+z] * int32(q.y1[1]))
 		}
 	}
+}
+
+// loadCoeffsLuma4 把第 n 个 4x4 亮度块的系数反量化进解码器的系数缓冲。
+//
+// loadCoeffsLuma4 dequantizes the levels of the n-th 4x4 luma block into the
+// decoder's coefficient buffer.
+func (e *encoder) loadCoeffsLuma4(n int) {
+	d := &e.d
+	q := d.q[0]
+	for z := 0; z < 16; z++ {
+		qq := q.y1[1]
+		if z == 0 {
+			qq = q.y1[0]
+		}
+		d.coeff[16*n+z] = int16(e.levels[16*n+z] * int32(qq))
+	}
+}
+
+// loadCoeffsChroma 把色度系数反量化进解码器的系数缓冲。
+//
+// loadCoeffsChroma dequantizes the chroma levels into the decoder's coefficient
+// buffer.
+func (e *encoder) loadCoeffsChroma() {
+	d := &e.d
+	q := d.q[0]
 	for c := 0; c < 4; c++ {
 		for z := 0; z < 16; z++ {
 			qq := q.uv[1]
@@ -578,6 +760,24 @@ func (e *encoder) loadCoeffs() {
 // IDCT and the DC-only fast path.
 func (e *encoder) setMasks() {
 	d := &e.d
+	d.nzDCMask = 0
+	d.nzACMask = 0
+	if d.usePredY16 {
+		e.setMasksLuma16()
+	} else {
+		for n := 0; n < 16; n++ {
+			e.setMasksLuma4(n)
+		}
+	}
+	e.setMasksChroma()
+}
+
+// setMasksLuma16 算出 16 个亮度块的 DC 与 AC 非零掩码。
+//
+// setMasksLuma16 derives the DC and AC non-zero masks of the sixteen luma
+// blocks.
+func (e *encoder) setMasksLuma16() {
+	d := &e.d
 	var dcMask, acMask uint32
 	for n := 0; n < 16; n++ {
 		if d.coeff[16*n] != 0 {
@@ -590,6 +790,35 @@ func (e *encoder) setMasks() {
 			}
 		}
 	}
+	d.nzDCMask = (d.nzDCMask &^ 0xffff) | dcMask
+	d.nzACMask = (d.nzACMask &^ 0xffff) | acMask
+}
+
+// setMasksLuma4 算出第 n 个 4x4 亮度块的非零掩码。
+//
+// setMasksLuma4 derives the non-zero masks of the n-th 4x4 luma block.
+func (e *encoder) setMasksLuma4(n int) {
+	d := &e.d
+	bit := uint32(1) << uint(n)
+	dcMask, acMask := d.nzDCMask&^bit, d.nzACMask&^bit
+	if d.coeff[16*n] != 0 {
+		dcMask |= bit
+	}
+	for z := 1; z < 16; z++ {
+		if d.coeff[16*n+z] != 0 {
+			acMask |= bit
+			break
+		}
+	}
+	d.nzDCMask, d.nzACMask = dcMask, acMask
+}
+
+// setMasksChroma 算出八个色度块的非零掩码。
+//
+// setMasksChroma derives the non-zero masks of the eight chroma blocks.
+func (e *encoder) setMasksChroma() {
+	d := &e.d
+	var dcMask, acMask uint32
 	for c := 0; c < 4; c++ {
 		if d.coeff[256+16*c] != 0 {
 			dcMask |= 1 << uint(16+c)
@@ -610,42 +839,66 @@ func (e *encoder) setMasks() {
 			}
 		}
 	}
-	d.nzDCMask = dcMask
-	d.nzACMask = acMask
+	d.nzDCMask = (d.nzDCMask &^ 0x0f0000) | dcMask
+	d.nzACMask = (d.nzACMask &^ 0x0f0000) | acMask
 }
 
-// writeTokens 按解码器解析的顺序写出系数 token：Y2、16 个亮度块、Cb、Cr。
-// 上下文与解码器一样取自上方与左侧宏块的非零标记。
+// writeTokens 按解码器解析的顺序写出系数 token：亮度与色度分开写，因为两者
+// 的上下文互不依赖。
 //
 // writeTokens emits the coefficient tokens in the order the decoder parses them:
-// Y2, the sixteen luma blocks, Cb, Cr. The contexts come from the above and left
-// non-zero flags, exactly as the decoder derives them.
+// the luma and the chroma are written separately because their contexts do not
+// depend on each other.
 func (e *encoder) writeTokens(mbx int) {
-	d := &e.d
-	nz := e.writeBlock4(planeY2, int(d.leftMB.nzY16+d.upMB[mbx].nzY16), false, 384)
-	d.leftMB.nzY16 = nz
-	d.upMB[mbx].nzY16 = nz
+	e.writeTokensLuma(mbx)
+	e.writeTokensChroma(mbx)
+}
 
+// writeTokensLuma 写出亮度系数：16x16 模式下先写 Y2 块再写十六个亮度块，
+// 4x4 模式下只写十六个亮度块且各带自己的 DC。上下文与解码器一样取自上方与
+// 左侧宏块的非零标记。
+//
+// writeTokensLuma emits the luma coefficients: with a 16x16 mode the Y2 block
+// comes first and the sixteen luma blocks follow, with 4x4 modes only the
+// sixteen luma blocks are written and each carries its own DC. The contexts
+// come from the above and left non-zero flags, exactly as the decoder derives
+// them.
+func (e *encoder) writeTokensLuma(mbx int) {
+	d := &e.d
+	coeffBase := 0
+	plane := planeY1SansY2
+	skipDC := false
+	if d.usePredY16 {
+		nz := e.writeBlock4(planeY2, int(d.leftMB.nzY16+d.upMB[mbx].nzY16), false, 384)
+		d.leftMB.nzY16 = nz
+		d.upMB[mbx].nzY16 = nz
+		plane = planeY1WithY2
+		skipDC = true
+	}
 	lnz := unpackMask[d.leftMB.nzMask&0x0f]
 	unz := unpackMask[d.upMB[mbx].nzMask&0x0f]
-	coeffBase := 0
 	for y := 0; y < 4; y++ {
 		nz := lnz[y]
 		for x := 0; x < 4; x++ {
-			nz = e.writeBlock4(planeY1WithY2, int(nz+unz[x]), true, coeffBase)
+			nz = e.writeBlock4(plane, int(nz+unz[x]), skipDC, coeffBase)
 			unz[x] = nz
 			coeffBase += 16
 		}
 		lnz[y] = nz
 	}
-	lnzMask := packMask(lnz, 0)
-	unzMask := packMask(unz, 0)
+	d.leftMB.nzMask = uint8(packMask(lnz, 0)) | (d.leftMB.nzMask & 0xf0)
+	d.upMB[mbx].nzMask = uint8(packMask(unz, 0)) | (d.upMB[mbx].nzMask & 0xf0)
+}
 
-	// 色度的系数缓冲按 Cb 四块、Cr 四块顺序连续排列，基址随之递增。
-	// The chroma coefficient buffer runs through the four Cb blocks and then the
-	// four Cr blocks, so the base advances with every block.
-	lnz = unpackMask[d.leftMB.nzMask>>4]
-	unz = unpackMask[d.upMB[mbx].nzMask>>4]
+// writeTokensChroma 写出色度系数：Cb 的四个块在前，Cr 的四个块在后。
+//
+// writeTokensChroma emits the chroma coefficients: the four Cb blocks come
+// first, then the four Cr blocks.
+func (e *encoder) writeTokensChroma(mbx int) {
+	d := &e.d
+	coeffBase := 256
+	lnz := unpackMask[d.leftMB.nzMask>>4]
+	unz := unpackMask[d.upMB[mbx].nzMask>>4]
 	for c := 0; c < 4; c += 2 {
 		for y := 0; y < 2; y++ {
 			nz := lnz[y+c]
@@ -657,10 +910,8 @@ func (e *encoder) writeTokens(mbx int) {
 			lnz[y+c] = nz
 		}
 	}
-	lnzMask |= packMask(lnz, 4)
-	unzMask |= packMask(unz, 4)
-	d.leftMB.nzMask = uint8(lnzMask)
-	d.upMB[mbx].nzMask = uint8(unzMask)
+	d.leftMB.nzMask = (d.leftMB.nzMask & 0x0f) | uint8(packMask(lnz, 4))
+	d.upMB[mbx].nzMask = (d.upMB[mbx].nzMask & 0x0f) | uint8(packMask(unz, 4))
 }
 
 // writeBlock4 写出一个 4x4 块的系数 token，返回该块是否有非零系数。skipDC
@@ -723,14 +974,14 @@ func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
 			e.putToken(plane, pBand, pCtx, 3, true)
 			e.putToken(plane, pBand, pCtx, 6, false)
 			e.putToken(plane, pBand, pCtx, 7, false)
-			e.tok.putBit(159, mag-5 == 1)
+			e.sink().putBit(159, mag-5 == 1)
 		case mag <= 10:
 			e.putToken(plane, pBand, pCtx, 2, true)
 			e.putToken(plane, pBand, pCtx, 3, true)
 			e.putToken(plane, pBand, pCtx, 6, false)
 			e.putToken(plane, pBand, pCtx, 7, true)
-			e.tok.putBit(165, (mag-7)>>1 == 1)
-			e.tok.putBit(145, (mag-7)&1 == 1)
+			e.sink().putBit(165, (mag-7)>>1 == 1)
+			e.sink().putBit(145, (mag-7)&1 == 1)
 		default:
 			cat, baseMag, nbits := 0, int32(11), 3
 			switch {
@@ -750,11 +1001,11 @@ func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
 			e.putToken(plane, pBand, pCtx, 9+b1, cat&1 == 1)
 			extra := uint32(mag - baseMag)
 			for i := 0; i < nbits; i++ {
-				e.tok.putBit(cat3456[cat][i], extra>>uint(nbits-1-i)&1 != 0)
+				e.sink().putBit(cat3456[cat][i], extra>>uint(nbits-1-i)&1 != 0)
 			}
 		}
 		pBand, pCtx = int(coeffBands[n]), ctx2
-		e.tok.putBit(uniformProb, v < 0)
+		e.sink().putBit(uniformProb, v < 0)
 
 		if n == 16 {
 			break
@@ -773,7 +1024,23 @@ func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
 //
 // putToken tallies and emits one token tree decision. The probability comes from
 // the current frame's table, so the second pass picks up the adapted values.
+//
+// 估算码长时用规范里的默认概率表而不是本帧的表：两遍编码因此会选出同样的
+// 模式与系数，第一遍统计到的分布与第二遍写出的码流完全对应。
+//
+// The length estimate uses the default table from the specification rather than
+// the frame's own table, so both passes pick the same modes and coefficients
+// and the statistics of the first pass match the stream of the second.
 func (e *encoder) putToken(plane, band, ctx, node int, bit bool) {
+	if e.estimating {
+		prob := defaultTokenProb[plane][band][ctx][node]
+		if bit {
+			e.cost.costBits += bitCostTable[1][prob]
+		} else {
+			e.cost.costBits += bitCostTable[0][prob]
+		}
+		return
+	}
 	if e.collect {
 		var b int
 		if bit {
@@ -784,40 +1051,16 @@ func (e *encoder) putToken(plane, band, ctx, node int, bit bool) {
 	e.tok.putBit(e.d.tokenProb[plane][band][ctx][node], bit)
 }
 
-// sadPlane 返回 n x n 块内预测与源的绝对差之和。
+// sink 返回当前写 token 的目标：正常编码时是真正的输出缓冲，估算时是只累计
+// 比特数的累加器。
 //
-// sadPlane returns the sum of absolute differences between the prediction and
-// the source over an n x n block.
-//
-// 这里是编码器里唯一适合向量化的热点，但实测收益不足以抵消代价，故保持标量：
-// 在 VGA 图像的编码总耗时中它约占 18%，熵编码（putBit）占 20%、预测占 22%，
-// 后两者是串行比特流与逐像素访存，向量化帮不上忙；即便 SAD 提速八倍，整帧也只
-// 快约 18%。而 simd 包要求调用方用 GOEXPERIMENT=simd 构建，否则连编译都不通过，
-// 且该包尚未承诺稳定——让所有使用方承担这个构建约束，不划算。
-//
-// This is the encoder's only hot spot that suits vectorisation, but the measured
-// gain does not cover the cost, so it stays scalar: it accounts for about 18% of
-// the encode time of a VGA image, while the entropy coder (putBit) takes 20% and
-// prediction 22% -- both are a serial bit stream and per-pixel memory traffic
-// that vectorisation cannot help. Even an eightfold faster SAD would only make
-// the frame about 18% quicker. Against that, the simd package requires callers
-// to build with GOEXPERIMENT=simd or nothing compiles at all, and it is not yet
-// covered by the compatibility promise, so imposing that build constraint on
-// every user is not worth it.
-func sadPlane(a, b *plane, x, y, n int) int {
-	s := 0
-	for j := 0; j < n; j++ {
-		ai := a.at(x, y+j)
-		bi := b.at(x, y+j)
-		for i := 0; i < n; i++ {
-			d := int(a.pix[ai+i]) - int(b.pix[bi+i])
-			if d < 0 {
-				d = -d
-			}
-			s += d
-		}
+// sink returns where the token bits go: the real output buffer while encoding
+// and the accumulator that only tallies the bits while estimating.
+func (e *encoder) sink() *boolEncoder {
+	if e.estimating {
+		return &e.cost
 	}
-	return s
+	return &e.tok
 }
 
 // quantize 把系数按反量化因子取整成电平值。

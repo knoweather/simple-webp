@@ -27,7 +27,7 @@ preserved, byte-exact write back.
 | image interface | ✅ | `ToImage()`, `*Webp` implements `image.Image`, `image.RegisterFormat("webp", ...)` |
 | Metadata editing | ✅ | rewrite with `ICCP`/`EXIF`/`XMP ` chunks, **pixels never re-encoded**, byte-exact when untouched |
 | VP8L lossless encode | ✅ | color-indexing / subtract-green / predictor / LZ77 / Huffman (≤15 bits) |
-| VP8 lossy encode | ✅ | intra only: 16x16 luma + 8x8 chroma modes, one quantizer, no loop filter, no rate control |
+| VP8 lossy encode | ✅ | intra only: rate-distortion mode decision, 16x16 or 4x4 luma modes, 8x8 chroma modes, one quantizer, no loop filter, no rate control |
 
 ## Install
 
@@ -105,6 +105,16 @@ err := simple_webp.EncodeLossy(out, img, &simple_webp.LossyOptions{
 Lossy WebP carries luma and chroma only, so the alpha channel is dropped;
 `EncodeBytes` is the lossless path to use when transparency matters.
 
+The lossy encoder chooses its modes by rate distortion. Every candidate mode
+is predicted, transformed and quantised, and the candidates are scored on the
+distortion of the reconstruction plus the number of bits their tokens take; the
+cheapest one wins. The luma of a macroblock is either one 16×16 mode or
+sixteen 4×4 modes, whichever comes out cheaper, and the chroma uses one of the
+four 8×8 modes. On a set of five test images the size at matched PSNR drops by
+6.7% against plain SAD mode selection (a 320×240 photo −3%, a smooth gradient
+−14%, a sharp synthetic image −38%, noise −0%). The search costs about 3.5x
+the encoding time: 18 ms instead of 5 ms for a 320×240 photo.
+
 ### Custom chunks
 
 The same extension point as simple-png:
@@ -159,8 +169,8 @@ Windows/amd64, Ryzen 7 7840HS, `go test -bench . -benchtime 1s`:
 | VP8L lossless decode (320×240) | 3.45 ms (22.3 MP/s) | 2.86 ms (26.9 MP/s) | 1.3–3.4× faster |
 | VP8 lossy decode, YUV only (400×300) | **1.02 ms** (117.8 MP/s) | 1.08 ms (111.4 MP/s) | — |
 | VP8 lossy decode + RGB (400×300) | 4.52 ms → **1.42 ms** (optimized, CT) | not supported | 0.208 ms (single-thread ≈ 6.8× slower) |
-| VP8 lossy encode (400×300) | 8.3 ms (14.4 MP/s) | not supported | — |
-| VP8 lossy encode (640×480) | 21.3 ms (14.4 MP/s) | not supported | — |
+| VP8 lossy encode (400×300) | 33.2 ms (3.6 MP/s) | not supported | — |
+| VP8 lossy encode (640×480) | 84.4 ms (3.6 MP/s) | not supported | — |
 
 > The libwebp column comes from a single thread on a different machine
 > (libwebp 1.5.0 `WebPDecodeRGBA`), scale reference only. Lossy decoding got a
@@ -178,15 +188,24 @@ meta-Huffman / color transform yet).
   lossless (VP8L) and `EncodeLossy` is the lossy path. The flag cannot be honoured
   as it stands because its zero value is `false`, so every caller that never set
   it would silently switch to lossy
-- **Lossy encoding is intra only.** The VP8 encoder uses 16x16 luma and 8x8
-  chroma modes with a fixed quantizer per frame, no 4x4 modes, no loop filter
-  and no rate control. Output is a valid stream any VP8 decoder accepts, but at
-  matched PSNR the files come out about 1.2-1.4x the size `cwebp` 1.5.0 produces
-  (measured on a 320x240 photo), since the 4x4 modes, the loop filter and the
-  rate-distortion optimisation are all missing
+- **Lossy encoding is intra only.** The VP8 encoder picks its modes by rate
+  distortion: every candidate goes through prediction, the forward transform
+  and quantisation, and the candidates are scored on the quantised distortion
+  plus the exact number of bits their tokens would take. The luma uses either
+  one 16x16 mode or sixteen 4x4 modes, whichever is cheaper, the chroma uses
+  8x8 modes, and the quantiser index is fixed for the frame. There is no loop
+  filter and no rate control. Output is a valid stream any VP8 decoder accepts,
+  but at matched PSNR the files are still larger than what `cwebp` 1.5.0
+  produces (about 1.2-1.4x when measured on a 320×240 photo), because the loop
+  filter and the rate control are missing
 - Lossy encoding runs twice: the first pass collects token statistics and the
   second encodes with probabilities adapted to them, which costs about 1.8x the
-  time of a single pass
+  time of a single pass. The mode search runs only in the first pass, the
+  second reuses the modes it found
+- The rate distortion search is what makes the encoder slow: scoring ten 4x4
+  modes for every block of every macroblock means running the transform and
+  the quantiser once per candidate. Encoding a 320×240 photo takes 18 ms
+  against 5 ms before, so the whole encoder is about 3.5x slower
 - The encoder implements neither color transform nor meta-Huffman blocked
   coding, so compression is weaker than `cwebp`
 - `ALPH` `preprocessing=1` (level reduction) is passed through as-is, without
@@ -199,23 +218,16 @@ meta-Huffman / color transform yet).
 
 ## Roadmap
 
-The lossy encoder is intra only by design. Two changes would close most of what
-is left between it and `cwebp`, in order of value:
+The lossy encoder is intra only by design. The rate-distortion mode decision
+and the 4x4 intra modes are in; what is left between it and `cwebp` is:
 
-- **Rate-distortion mode decision.** Modes are picked by SAD alone, which ignores
-  what the residual costs to code. Scoring the four luma and four chroma modes by
-  quantised distortion plus a rate estimate usually gains 5-15%, at the price of
-  running the forward transform and quantiser once per candidate, so encoding
-  becomes two to three times slower again.
-- **4x4 intra modes.** Only the 16x16 luma modes exist, so detailed and textured
-  regions are predicted from one direction across the whole macroblock. Adding
-  the ten 4x4 modes with their context-coded mode tree is the largest single
-  gain, and also the largest change: per-block prediction chaining, per-block
-  non-zero masks and a different handling of the Y2 block.
-
-The loop filter is deliberately absent from that list. This decoder filters after
-the whole frame, so filtering cannot improve prediction, and what it buys is
-subjective smoothness rather than PSNR at a given size.
+- **Rate control.** The quantiser index is fixed for the whole frame, so the
+  size of the output is whatever the image happens to need at that quality. A
+  target-bitrate mode would have to move the quantiser per macroblock, which
+  the frame header supports through the per-segment deltas.
+- **Loop filter.** Deliberately absent: this decoder filters after the whole
+  frame, so filtering cannot improve prediction, and what it buys is
+  subjective smoothness rather than PSNR at a given size.
 
 ## Safety / pixel budget
 

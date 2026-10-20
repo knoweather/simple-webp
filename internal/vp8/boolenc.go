@@ -1,5 +1,7 @@
 package vp8
 
+import "math"
+
 // boolEncoder 是 boolDecoder 的逆运算，输出 RFC 6386 第 7 节的布尔编码码流。
 //
 // 编码器保存完整的 range（解码器存的是 range-1），状态以 24 位区间下界 low 为
@@ -33,6 +35,14 @@ type boolEncoder struct {
 	// dry runs the state machine without producing bytes, for the statistics
 	// pass.
 	dry bool
+	// costMode 为真时 putBit 不产出字节，只把该比特的编码代价累加到 costBits，
+	// 用于率失真决策时估算一段码流的位数。
+	//
+	// With costMode set, putBit produces no bytes and only adds the cost of
+	// coding the bit to costBits, which estimates the length of a stretch of
+	// the stream for the rate distortion decisions.
+	costMode bool
+	costBits float64
 }
 
 // init 复位编码器。range 与解码器一致取 255（即 rngM1=254），窗口为空。
@@ -50,6 +60,14 @@ func (e *boolEncoder) init() {
 //
 // putBit encodes one bit with prob as the probability of a zero.
 func (e *boolEncoder) putBit(prob uint8, bit bool) {
+	if e.costMode {
+		if bit {
+			e.costBits += bitCostTable[1][prob]
+		} else {
+			e.costBits += bitCostTable[0][prob]
+		}
+		return
+	}
 	if e.dry {
 		return
 	}
@@ -165,4 +183,28 @@ func normShift(rng uint32) int {
 		n++
 	}
 	return n
+}
+
+// bitCostTable 预先算好每个概率下编码零与一的代价（比特数）。率失真决策会
+// 反复估算码长，每次都调用 math.Log2 太慢，查表快得多。
+//
+// bitCostTable holds the cost in bits of coding a zero and a one for every
+// probability. The rate distortion decisions estimate the length of the code
+// over and over, and calling math.Log2 every time is too slow.
+var bitCostTable [2][256]float64
+
+func init() {
+	for p := 0; p < 256; p++ {
+		prob := float64(p) / 256
+		zero := 1e9
+		one := 1e9
+		if prob > 0 {
+			zero = -math.Log2(prob)
+		}
+		if prob < 1 {
+			one = -math.Log2(1 - prob)
+		}
+		bitCostTable[0][p] = zero
+		bitCostTable[1][p] = one
+	}
 }

@@ -307,28 +307,14 @@ func (d *decoder) reconstructMacroblock(mbx, mby int) {
 		d.predict16(checkTopLeftPred(mbx, mby, d.predY16), bx, by)
 		for j := 0; j < 4; j++ {
 			for i := 0; i < 4; i++ {
-				n := 4*j + i
-				x, y := bx+i*4, by+j*4
-				mask := uint32(1) << uint(n)
-				if d.nzACMask&mask != 0 {
-					d.addIDCT4Plane(d.y, x, y, 16*n)
-				} else if d.nzDCMask&mask != 0 {
-					d.addIDCT4DCPlane(d.y, x, y, 16*n)
-				}
+				d.addResidual4(bx+i*4, by+j*4, 4*j+i)
 			}
 		}
 	} else {
 		for j := 0; j < 4; j++ {
 			for i := 0; i < 4; i++ {
-				n := 4*j + i
-				x, y := bx+i*4, by+j*4
-				d.predict4(d.predY4[j][i], x, y)
-				mask := uint32(1) << uint(n)
-				if d.nzACMask&mask != 0 {
-					d.addIDCT4Plane(d.y, x, y, 16*n)
-				} else if d.nzDCMask&mask != 0 {
-					d.addIDCT4DCPlane(d.y, x, y, 16*n)
-				}
+				d.predict4(d.predY4[j][i], bx+i*4, by+j*4)
+				d.addResidual4(bx+i*4, by+j*4, 4*j+i)
 			}
 		}
 	}
@@ -346,6 +332,21 @@ func (d *decoder) reconstructMacroblock(mbx, mby int) {
 		d.addIDCT8Plane(d.cr, cx, cy, 320)
 	} else if d.nzDCMask&0xf00000 != 0 {
 		d.addIDCT8DCPlane(d.cr, cx, cy, 320)
+	}
+}
+
+// addResidual4 把一个 4x4 块的逆变换结果加到平面 (x, y) 处：AC 非零的块走
+// 完整 IDCT，只有 DC 非零的块走 DC-only 快路径。
+//
+// addResidual4 adds the inverse transform of one 4x4 block to the plane at
+// (x, y): blocks with non zero AC take the full IDCT, blocks with only a non
+// zero DC take the DC-only fast path.
+func (d *decoder) addResidual4(x, y, n int) {
+	mask := uint32(1) << uint(n)
+	if d.nzACMask&mask != 0 {
+		d.addIDCT4Plane(d.y, x, y, 16*n)
+	} else if d.nzDCMask&mask != 0 {
+		d.addIDCT4DCPlane(d.y, x, y, 16*n)
 	}
 }
 
