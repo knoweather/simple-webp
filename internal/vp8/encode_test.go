@@ -53,17 +53,29 @@ func testImage(w, h int) *image.YCbCr {
 	return img
 }
 
-// psnr 计算两幅 4:2:0 图像在亮度平面上的峰值信噪比。
+// psnr 计算两幅 4:2:0 图像在三个平面上的峰值信噪比。色度也计入，否则色度
+// 通道的错误会被完全掩盖。
 //
-// psnr computes the peak signal to noise ratio of the luma plane.
+// psnr computes the peak signal to noise ratio over all three planes. Chroma
+// counts too, otherwise an error in the chroma channels stays invisible.
 func psnr(a, b *image.YCbCr) float64 {
 	var se float64
 	n := 0
+	add := func(x, y byte) {
+		d := float64(x) - float64(y)
+		se += d * d
+		n++
+	}
 	for y := 0; y < a.Rect.Dy(); y++ {
 		for x := 0; x < a.Rect.Dx(); x++ {
-			d := float64(a.Y[y*a.YStride+x]) - float64(b.Y[y*b.YStride+x])
-			se += d * d
-			n++
+			add(a.Y[y*a.YStride+x], b.Y[y*b.YStride+x])
+		}
+	}
+	cw, ch := (a.Rect.Dx()+1)/2, (a.Rect.Dy()+1)/2
+	for y := 0; y < ch; y++ {
+		for x := 0; x < cw; x++ {
+			add(a.Cb[y*a.CStride+x], b.Cb[y*b.CStride+x])
+			add(a.Cr[y*a.CStride+x], b.Cr[y*b.CStride+x])
 		}
 	}
 	if se == 0 {
@@ -273,6 +285,46 @@ func TestEncodeRandomContent(t *testing.T) {
 		}
 		if got.Rect.Dx() != w || got.Rect.Dy() != h {
 			t.Fatalf("%dx%d: decoded %dx%d", w, h, got.Rect.Dx(), got.Rect.Dy())
+		}
+	}
+}
+
+// TestEncodeReconstructionMatchesDecode 校验编码器内部维护的重建与真正解码出
+// 来的像素逐采样一致。这是整个编码器的核心不变量：一旦两者分叉，后续宏块的
+// 预测就会建立在错误的参考像素上，码流本身仍然自洽，任何解码器都看不出问题。
+//
+// TestEncodeReconstructionMatchesDecode checks that the reconstruction the
+// encoder keeps matches the decoded samples exactly. That is the encoder's core
+// invariant: once the two diverge, later macroblocks predict from the wrong
+// reference pixels, and the stream stays self consistent, so no decoder can
+// notice.
+func TestEncodeReconstructionMatchesDecode(t *testing.T) {
+	for _, q := range []int{0, 10, 25, 50, 70, 80, 90, 100} {
+		w, h := 64, 48
+		src := testImage(w, h)
+		e := newEncoder(w, h, src, q)
+		data := e.run()
+		dec, err := Decode(data)
+		if err != nil {
+			t.Fatalf("q=%d: decode: %v", q, err)
+		}
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				if got, want := e.d.y.pix[e.d.y.at(x, y)], dec.Y[y*dec.YStride+x]; got != want {
+					t.Fatalf("q=%d: luma (%d,%d) encoder %d != decoded %d", q, x, y, got, want)
+				}
+			}
+		}
+		cw, ch := (w+1)/2, (h+1)/2
+		for y := 0; y < ch; y++ {
+			for x := 0; x < cw; x++ {
+				if got, want := e.d.cb.pix[e.d.cb.at(x, y)], dec.Cb[y*dec.CStride+x]; got != want {
+					t.Fatalf("q=%d: Cb (%d,%d) encoder %d != decoded %d", q, x, y, got, want)
+				}
+				if got, want := e.d.cr.pix[e.d.cr.at(x, y)], dec.Cr[y*dec.CStride+x]; got != want {
+					t.Fatalf("q=%d: Cr (%d,%d) encoder %d != decoded %d", q, x, y, got, want)
+				}
+			}
 		}
 	}
 }

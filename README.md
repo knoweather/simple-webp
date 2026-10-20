@@ -176,9 +176,10 @@ meta-Huffman / color transform yet).
 - `EncodeOptions.Lossless` is accepted but ignored: `Encode` always writes lossless (VP8L)
 - **Lossy encoding is intra only.** The VP8 encoder uses 16x16 luma and 8x8
   chroma modes with a fixed quantizer per frame, no 4x4 modes, no loop filter
-  and no rate control. Output is a valid stream any VP8 decoder accepts, but
-  for the same quality the files are larger than `cwebp` produces, since the 4x4
-  modes and the rate-distortion optimisation are missing
+  and no rate control. Output is a valid stream any VP8 decoder accepts, but at
+  matched PSNR the files come out about 1.7-1.9x the size `cwebp` 1.5.0 produces
+  (measured on a 320x240 photo), since the 4x4 modes, the loop filter and the
+  rate-distortion optimisation are all missing
 - The encoder implements neither color transform nor meta-Huffman blocked
   coding, so compression is weaker than `cwebp`
 - `ALPH` `preprocessing=1` (level reduction) is passed through as-is, without

@@ -494,7 +494,6 @@ func (e *encoder) writeTokens(mbx int) {
 	d.leftMB.nzY16 = nz
 	d.upMB[mbx].nzY16 = nz
 
-	var nzDC, nzAC [4]uint8
 	lnz := unpackMask[d.leftMB.nzMask&0x0f]
 	unz := unpackMask[d.upMB[mbx].nzMask&0x0f]
 	coeffBase := 0
@@ -503,8 +502,6 @@ func (e *encoder) writeTokens(mbx int) {
 		for x := 0; x < 4; x++ {
 			nz = e.writeBlock4(planeY1WithY2, int(nz+unz[x]), true, coeffBase)
 			unz[x] = nz
-			nzAC[x] = nz
-			nzDC[x] = btou(d.coeff[coeffBase] != 0)
 			coeffBase += 16
 		}
 		lnz[y] = nz
@@ -512,16 +509,18 @@ func (e *encoder) writeTokens(mbx int) {
 	lnzMask := packMask(lnz, 0)
 	unzMask := packMask(unz, 0)
 
+	// 色度的系数缓冲按 Cb 四块、Cr 四块顺序连续排列，基址随之递增。
+	// The chroma coefficient buffer runs through the four Cb blocks and then the
+	// four Cr blocks, so the base advances with every block.
 	lnz = unpackMask[d.leftMB.nzMask>>4]
 	unz = unpackMask[d.upMB[mbx].nzMask>>4]
 	for c := 0; c < 4; c += 2 {
 		for y := 0; y < 2; y++ {
 			nz := lnz[y+c]
 			for x := 0; x < 2; x++ {
-				nz = e.writeBlock4(planeUV, int(nz+unz[x+c]), false, 256+16*(c+y*2+x))
+				nz = e.writeBlock4(planeUV, int(nz+unz[x+c]), false, coeffBase)
 				unz[x+c] = nz
-				nzAC[y*2+x] = nz
-				nzDC[y*2+x] = btou(d.coeff[256+16*(c+y*2+x)] != 0)
+				coeffBase += 16
 			}
 			lnz[y+c] = nz
 		}
