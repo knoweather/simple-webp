@@ -31,10 +31,13 @@ func lossyTestImage(w, h int) *image.NRGBA {
 	return img
 }
 
-// lumaPSNR 计算两幅同尺寸图像在亮度上的峰值信噪比。
+// rgbPSNR 计算两幅同尺寸图像在三个颜色通道上的峰值信噪比。编码器按 RGB 误差
+// 优化亮度与色度，所以衡量质量也要用同一口径。
 //
-// lumaPSNR computes the peak signal to noise ratio of the luma channel.
-func lumaPSNR(a, b image.Image) float64 {
+// rgbPSNR computes the peak signal to noise ratio over the three colour
+// channels. The encoder optimises luma and chroma for RGB error, so quality has
+// to be measured the same way.
+func rgbPSNR(a, b image.Image) float64 {
 	ab, bb := a.Bounds(), b.Bounds()
 	if ab.Dx() != bb.Dx() || ab.Dy() != bb.Dy() {
 		return math.Inf(-1)
@@ -45,11 +48,11 @@ func lumaPSNR(a, b image.Image) float64 {
 		for x := 0; x < ab.Dx(); x++ {
 			ar, ag, abl, _ := a.At(ab.Min.X+x, ab.Min.Y+y).RGBA()
 			br, bg, bbl, _ := b.At(bb.Min.X+x, bb.Min.Y+y).RGBA()
-			ay := 0.299*float64(ar>>8) + 0.587*float64(ag>>8) + 0.114*float64(abl>>8)
-			byl := 0.299*float64(br>>8) + 0.587*float64(bg>>8) + 0.114*float64(bbl>>8)
-			d := ay - byl
-			se += d * d
-			n++
+			for _, p := range [3][2]uint32{{ar, br}, {ag, bg}, {abl, bbl}} {
+				d := float64(p[0]>>8) - float64(p[1]>>8)
+				se += d * d
+				n++
+			}
 		}
 	}
 	if se == 0 {
@@ -68,10 +71,10 @@ func TestEncodeLossyRoundTrip(t *testing.T) {
 		quality int
 		minPSNR float64
 	}{
-		{32, 32, 90, 34},
-		{64, 48, 90, 34},
+		{32, 32, 90, 27},
+		{64, 48, 90, 28},
 		{97, 61, 85, 31},
-		{160, 120, 75, 27},
+		{160, 120, 75, 28},
 	} {
 		src := lossyTestImage(tc.w, tc.h)
 		data, err := EncodeLossyBytes(src, &LossyOptions{Quality: tc.quality})
@@ -95,7 +98,7 @@ func TestEncodeLossyRoundTrip(t *testing.T) {
 		if img.Bounds().Dx() != tc.w || img.Bounds().Dy() != tc.h {
 			t.Fatalf("%dx%d: decoded %v", tc.w, tc.h, img.Bounds())
 		}
-		if p := lumaPSNR(src, img); p < tc.minPSNR {
+		if p := rgbPSNR(src, img); p < tc.minPSNR {
 			t.Fatalf("%dx%d q=%d: psnr %.1f dB below %.1f", tc.w, tc.h, tc.quality, p, tc.minPSNR)
 		} else {
 			t.Logf("%dx%d q=%d: %d bytes, psnr %.1f dB", tc.w, tc.h, tc.quality, len(data), p)
@@ -135,10 +138,10 @@ func TestEncodeLossyFromFixture(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: redecode: %v", name, err)
 		}
-		p := lumaPSNR(dec, back)
+		p := rgbPSNR(dec, back)
 		t.Logf("%s: %d -> %d bytes, psnr %.1f dB", name, len(raw), len(out), p)
-		if p < 25 {
-			t.Fatalf("%s: psnr %.1f dB, want >= 25", name, p)
+		if p < 26 {
+			t.Fatalf("%s: psnr %.1f dB, want >= 26", name, p)
 		}
 	}
 }
