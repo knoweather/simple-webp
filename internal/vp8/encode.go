@@ -78,11 +78,12 @@ type encoder struct {
 	rdScale float64
 }
 
-// mbDecision 记录一个宏块选中的模式：16x16 与 4x4 两条路各记一套，外加色度
-// 模式。
+// mbDecision 记录一个宏块的模式决策：亮度走的是整块 16x16 还是十六个 4x4
+// （走哪条只有对应的那一套模式有意义），外加色度模式。
 //
-// mbDecision records the modes chosen for one macroblock: one set for the 16x16
-// path and one for the 4x4 path, plus the chroma mode.
+// mbDecision records the mode decision of one macroblock: whether the luma took
+// the whole 16x16 route or the sixteen 4x4 blocks (only the matching set of
+// modes is meaningful), plus the chroma mode.
 type mbDecision struct {
 	useY16  bool
 	predY16 uint8
@@ -122,15 +123,6 @@ const (
 // Encode codes a 4:2:0 YCbCr image as a VP8 key frame. quality runs from 0
 // (smallest) to 100 (best).
 func Encode(src *image.YCbCr, quality int) ([]byte, error) {
-	return EncodeWithScale(src, quality, rdScaleDefault)
-}
-
-// EncodeWithScale 与 Encode 相同，但把率失真权衡系数乘上给定的倍率；倍率零
-// 表示用默认值。
-//
-// EncodeWithScale is Encode with the rate distortion trade-off factor scaled
-// by the given factor; a factor of zero means the default.
-func EncodeWithScale(src *image.YCbCr, quality int, scale float64) ([]byte, error) {
 	if src.SubsampleRatio != image.YCbCrSubsampleRatio420 {
 		return nil, ErrInvalid
 	}
@@ -139,9 +131,6 @@ func EncodeWithScale(src *image.YCbCr, quality int, scale float64) ([]byte, erro
 		return nil, ErrInvalid
 	}
 	e := newEncoder(w, h, src, quality)
-	if scale > 0 {
-		e.rdScale = scale
-	}
 	return e.run(), nil
 }
 
@@ -561,7 +550,7 @@ func (e *encoder) buildMacroblock(mbx, mby, bx, by, cx, cy int) {
 
 // levelsAreZero 报告当前宏块的系数是否全为零，也就是可以只做预测。
 //
-// levelsAreZero reports whether every coefficient of the macroblock
+// levelsAreZero reports whether every coefficient of the macroblock was
 // quantized to zero, meaning the macroblock needs prediction only.
 func (e *encoder) levelsAreZero() bool {
 	for _, v := range e.levels {

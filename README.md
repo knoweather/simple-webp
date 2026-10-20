@@ -106,14 +106,15 @@ Lossy WebP carries luma and chroma only, so the alpha channel is dropped;
 `EncodeBytes` is the lossless path to use when transparency matters.
 
 The lossy encoder chooses its modes by rate distortion. Every candidate mode
-is predicted, transformed and quantised, and the candidates are scored on the
-distortion of the reconstruction plus the number of bits their tokens take; the
-cheapest one wins. The luma of a macroblock is either one 16×16 mode or
-sixteen 4×4 modes, whichever comes out cheaper, and the chroma uses one of the
-four 8×8 modes. On a set of five test images the size at matched PSNR drops by
-6.7% against plain SAD mode selection (a 320×240 photo −3%, a smooth gradient
-−14%, a sharp synthetic image −38%, noise −0%). The search costs about 3.5x
-the encoding time: 18 ms instead of 5 ms for a 320×240 photo.
+is predicted, transformed and quantized, and the candidates are scored on the
+distortion of the reconstruction plus lambda times the number of bits their
+tokens take; the cheapest one wins. The luma of a macroblock is either one
+16×16 mode or sixteen 4×4 modes, whichever comes out cheaper, and the chroma
+uses one of the four 8×8 modes. On a set of five test images the size at
+matched PSNR drops by 6.7% against plain SAD mode selection (a 320×240 photo
+−3%, a smooth gradient −14%, a sharp synthetic image −38%, noise −0%). The
+search costs about 3.5x the encoding time: 18 ms instead of 5 ms for a
+320×240 photo.
 
 ### Custom chunks
 
@@ -139,7 +140,7 @@ animation.go   ANMF frame compositing (blend / dispose)
 vp8.go         VP8 → NRGBA (9:3:3:1 fancy upsampling + fixed-point BT.601)
 image.go       image.RegisterFormat / Decode / DecodeConfig / image.Image
 encode.go      image.Image → VP8L → RIFF
-internal/vp8/  VP8 lossy decoder (bool decode, prediction, IDCT, loop filter)
+internal/vp8/  VP8 lossy decoder + encoder (bool coder, prediction, IDCT, loop filter, RD mode decision)
 internal/vp8l/ VP8L lossless decoder + encoder (bitstream, Huffman, LZ77, transforms)
 testdata/      fixtures generated against libwebp (.webp + .rgba references)
 ```
@@ -196,8 +197,9 @@ meta-Huffman / color transform yet).
   8x8 modes, and the quantiser index is fixed for the frame. There is no loop
   filter and no rate control. Output is a valid stream any VP8 decoder accepts,
   but at matched PSNR the files are still larger than what `cwebp` 1.5.0
-  produces (about 1.2-1.4x when measured on a 320×240 photo), because the loop
-  filter and the rate control are missing
+  produces (about 1.2-1.4x when measured on a 320×240 photo; that figure
+  predates the rate-distortion work above, which is roughly 7% smaller), because
+  the loop filter and the rate control are missing
 - Lossy encoding runs twice: the first pass collects token statistics and the
   second encodes with probabilities adapted to them, which costs about 1.8x the
   time of a single pass. The mode search runs only in the first pass, the

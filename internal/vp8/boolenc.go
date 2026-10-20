@@ -42,6 +42,9 @@ type boolEncoder struct {
 	// coding the bit to costBits, which estimates the length of a stretch of
 	// the stream for the rate distortion decisions.
 	costMode bool
+	// costBits 是 costMode 下累加的比特数。
+	//
+	// costBits is the number of bits accumulated while in costMode.
 	costBits float64
 }
 
@@ -186,11 +189,14 @@ func normShift(rng uint32) int {
 }
 
 // bitCostTable 预先算好每个概率下编码零与一的代价（比特数）。率失真决策会
-// 反复估算码长，每次都调用 math.Log2 太慢，查表快得多。
+// 反复估算码长，每次都调用 math.Log2 太慢，查表快得多。概率为 0 或 256 时
+// 代价发散，用 1e9 代替无穷大，避免代价算出 Inf 或 NaN。
 //
 // bitCostTable holds the cost in bits of coding a zero and a one for every
 // probability. The rate distortion decisions estimate the length of the code
-// over and over, and calling math.Log2 every time is too slow.
+// over and over, and calling math.Log2 every time is too slow. A probability of
+// 0 or 256 makes the cost infinite, so 1e9 stands in for it to keep the sums
+// finite.
 var bitCostTable [2][256]float64
 
 func init() {
