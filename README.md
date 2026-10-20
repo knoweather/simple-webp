@@ -5,8 +5,9 @@
 
 **English** | [简体中文](./README.zh-CN.md)
 
-Pure-Go WebP parse / decode / encode — no cgo, no third-party runtime
-dependencies. Container parsing, VP8 lossy decoding, VP8L lossless
+Pure-Go WebP parse / decode / encode — no cgo. Everything is written from
+scratch and returns standard `image.Image`; the only third-party module is
+`github.com/pkg/errors` (used for error wrapping). Container parsing, VP8 lossy decoding, VP8L lossless
 decoding+encoding, ALPH transparency, animation compositing — all implemented
 from scratch, returning standard `image.Image`.
 

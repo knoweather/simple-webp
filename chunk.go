@@ -22,7 +22,7 @@ type ChunkParse interface {
 	// Parse 解码给定 chunk 的载荷，出错时返回非 nil error。
 	// Parse decodes the payload of the given chunk and returns a non-nil
 	// error on failure.
-	Parse(chunk *riffChunk) error
+	Parse(chunk *RawChunk) error
 }
 
 // RawChunk 表示未被原生解码、以原始字节形式保留的 chunk（例如未知的应用私有
@@ -87,13 +87,13 @@ func (v *VP8X) ChunkName() FourCC { return VP8XChunk }
 // Parse decodes the VP8X payload: it reads the flag byte and the canvas
 // dimensions, which are stored minus one and therefore get incremented.
 // A payload shorter than 10 bytes is treated as corrupt.
-func (v *VP8X) Parse(c *riffChunk) error {
-	if len(c.data) < 10 {
-		return errors.Errorf("invalid vp8x chunk: %d bytes", len(c.data))
+func (v *VP8X) Parse(c *RawChunk) error {
+	if len(c.Data) < 10 {
+		return errors.Errorf("invalid vp8x chunk: %d bytes", len(c.Data))
 	}
-	v.Flags = c.data[0]
-	v.CanvasWidth = int(readUint24(c.data[4:7])) + 1
-	v.CanvasHeight = int(readUint24(c.data[7:10])) + 1
+	v.Flags = c.Data[0]
+	v.CanvasWidth = int(readUint24(c.Data[4:7])) + 1
+	v.CanvasHeight = int(readUint24(c.Data[7:10])) + 1
 	return nil
 }
 
@@ -164,26 +164,26 @@ func (v *VP8) ChunkName() FourCC { return VP8Chunk }
 // and the dimension fields (16 bits each, the low 14 bits taken, the high
 // 2 scale bits ignored here). Data keeps the whole payload; a non-key frame,
 // a bad start code or a zero dimension is rejected.
-func (v *VP8) Parse(c *riffChunk) error {
-	if len(c.data) < 10 {
-		return errors.Errorf("invalid vp8 chunk: %d bytes", len(c.data))
+func (v *VP8) Parse(c *RawChunk) error {
+	if len(c.Data) < 10 {
+		return errors.Errorf("invalid vp8 chunk: %d bytes", len(c.Data))
 	}
-	tag := uint32(c.data[0]) | uint32(c.data[1])<<8 | uint32(c.data[2])<<16
+	tag := uint32(c.Data[0]) | uint32(c.Data[1])<<8 | uint32(c.Data[2])<<16
 	if tag&0x1 != 0 {
 		return errors.New("invalid vp8 chunk: not a key frame")
 	}
 	v.Version = uint8(tag >> 1 & 0x7)
 	v.ShowFrame = tag>>4&0x1 != 0
 	v.FirstPartSize = int(tag >> 5)
-	if c.data[3] != 0x9d || c.data[4] != 0x01 || c.data[5] != 0x2a {
+	if c.Data[3] != 0x9d || c.Data[4] != 0x01 || c.Data[5] != 0x2a {
 		return errors.New("invalid vp8 chunk: bad start code")
 	}
-	v.Width = int(by.Uint16(c.data[6:8]) & 0x3fff)
-	v.Height = int(by.Uint16(c.data[8:10]) & 0x3fff)
+	v.Width = int(by.Uint16(c.Data[6:8]) & 0x3fff)
+	v.Height = int(by.Uint16(c.Data[8:10]) & 0x3fff)
 	if v.Width == 0 || v.Height == 0 {
 		return errors.New("invalid vp8 chunk: zero size")
 	}
-	v.Data = c.data
+	v.Data = c.Data
 	return nil
 }
 
@@ -232,14 +232,14 @@ func (v *VP8L) ChunkName() FourCC { return VP8LChunk }
 // then reads the dimensions (stored minus one, so incremented), the
 // alpha-used flag and the version number; a version other than 0 is
 // rejected. Data keeps the whole payload.
-func (v *VP8L) Parse(c *riffChunk) error {
-	if len(c.data) < 5 {
-		return errors.Errorf("invalid vp8l chunk: %d bytes", len(c.data))
+func (v *VP8L) Parse(c *RawChunk) error {
+	if len(c.Data) < 5 {
+		return errors.Errorf("invalid vp8l chunk: %d bytes", len(c.Data))
 	}
-	if c.data[0] != 0x2f {
-		return errors.Errorf("invalid vp8l chunk: bad signature 0x%02x", c.data[0])
+	if c.Data[0] != 0x2f {
+		return errors.Errorf("invalid vp8l chunk: bad signature 0x%02x", c.Data[0])
 	}
-	bits := by.Uint32(c.data[1:5])
+	bits := by.Uint32(c.Data[1:5])
 	v.Width = int(bits&0x3fff) + 1
 	v.Height = int(bits>>14&0x3fff) + 1
 	v.AlphaUsed = bits>>28&0x1 != 0
@@ -247,7 +247,7 @@ func (v *VP8L) Parse(c *riffChunk) error {
 	if v.Version != 0 {
 		return errors.Errorf("unsupported vp8l version %d", v.Version)
 	}
-	v.Data = c.data
+	v.Data = c.Data
 	return nil
 }
 
@@ -309,18 +309,18 @@ func (a *ALPH) ChunkName() FourCC { return ALPHChunk }
 // preprocessing (bits 4-5) methods from the ALPH flag byte and keeps the
 // remaining bytes as compressed alpha data; a compression method above 1
 // is rejected.
-func (a *ALPH) Parse(c *riffChunk) error {
-	if len(c.data) < 1 {
+func (a *ALPH) Parse(c *RawChunk) error {
+	if len(c.Data) < 1 {
 		return errors.New("invalid alph chunk: empty")
 	}
-	head := c.data[0]
+	head := c.Data[0]
 	a.Compression = head & 0x3
 	a.Filter = head >> 2 & 0x3
 	a.Preprocessing = head >> 4 & 0x3
 	if a.Compression > ALPHCompressionLossless {
 		return errors.Errorf("unsupported alph compression method %d", a.Compression)
 	}
-	a.Data = c.data[1:]
+	a.Data = c.Data[1:]
 	return nil
 }
 
@@ -361,12 +361,12 @@ func (a *ANIM) ChunkName() FourCC { return ANIMChunk }
 // Parse 解析 6 字节 ANIM 载荷：4 字节背景色（BGRA 字节序）与 2 字节循环次数。
 // Parse decodes the 6-byte ANIM payload: the 32-bit background colour in
 // BGRA byte order and the 16-bit loop count.
-func (a *ANIM) Parse(c *riffChunk) error {
-	if len(c.data) < 6 {
-		return errors.Errorf("invalid anim chunk: %d bytes", len(c.data))
+func (a *ANIM) Parse(c *RawChunk) error {
+	if len(c.Data) < 6 {
+		return errors.Errorf("invalid anim chunk: %d bytes", len(c.Data))
 	}
-	a.BackgroundColor = by.Uint32(c.data[:4])
-	a.LoopCount = by.Uint16(c.data[4:6])
+	a.BackgroundColor = by.Uint32(c.Data[:4])
+	a.LoopCount = by.Uint16(c.Data[4:6])
 	return nil
 }
 
@@ -432,20 +432,20 @@ func (a *ANMF) ChunkName() FourCC { return ANMFChunk }
 // incremented on read, the duration is in milliseconds; the rest of the
 // payload is treated as a nested RIFF stream from which the ALPH, VP8 and
 // VP8L sub-chunks are parsed. A frame without any image data is rejected.
-func (a *ANMF) Parse(c *riffChunk) error {
-	if len(c.data) < 16 {
-		return errors.Errorf("invalid anmf chunk: %d bytes", len(c.data))
+func (a *ANMF) Parse(c *RawChunk) error {
+	if len(c.Data) < 16 {
+		return errors.Errorf("invalid anmf chunk: %d bytes", len(c.Data))
 	}
-	a.X = int(readUint24(c.data[0:3])) * 2
-	a.Y = int(readUint24(c.data[3:6])) * 2
-	a.Width = int(readUint24(c.data[6:9])) + 1
-	a.Height = int(readUint24(c.data[9:12])) + 1
-	a.Duration = int(readUint24(c.data[12:15]))
-	flags := c.data[15]
+	a.X = int(readUint24(c.Data[0:3])) * 2
+	a.Y = int(readUint24(c.Data[3:6])) * 2
+	a.Width = int(readUint24(c.Data[6:9])) + 1
+	a.Height = int(readUint24(c.Data[9:12])) + 1
+	a.Duration = int(readUint24(c.Data[12:15]))
+	flags := c.Data[15]
 	a.Blend = flags&0x2 == 0
 	a.Dispose = flags&0x1 != 0
 
-	r := bytes.NewReader(c.data[16:])
+	r := bytes.NewReader(c.Data[16:])
 	for {
 		// 逐个读出嵌套的子 chunk 直到流结束；未知类型的子 chunk 直接跳过。
 		// Read the nested sub-chunks until the stream ends; unknown types are skipped.
@@ -459,17 +459,17 @@ func (a *ANMF) Parse(c *riffChunk) error {
 		switch sub.name {
 		case ALPHChunk:
 			a.ALPH = &ALPH{}
-			if err = a.ALPH.Parse(sub); err != nil {
+			if err = a.ALPH.Parse(&RawChunk{Name: sub.name, Data: sub.data}); err != nil {
 				return err
 			}
 		case VP8Chunk:
 			a.VP8 = &VP8{}
-			if err = a.VP8.Parse(sub); err != nil {
+			if err = a.VP8.Parse(&RawChunk{Name: sub.name, Data: sub.data}); err != nil {
 				return err
 			}
 		case VP8LChunk:
 			a.VP8L = &VP8L{}
-			if err = a.VP8L.Parse(sub); err != nil {
+			if err = a.VP8L.Parse(&RawChunk{Name: sub.name, Data: sub.data}); err != nil {
 				return err
 			}
 		}
@@ -525,8 +525,8 @@ type ICCP struct {
 func (i *ICCP) ChunkName() FourCC { return ICCPChunk }
 
 // Parse 原样保留 ICCP 载荷，不作解释。/ Parse keeps the ICCP payload verbatim without interpreting it.
-func (i *ICCP) Parse(c *riffChunk) error {
-	i.Data = c.data
+func (i *ICCP) Parse(c *RawChunk) error {
+	i.Data = c.Data
 	return nil
 }
 
@@ -540,8 +540,8 @@ type EXIF struct {
 func (e *EXIF) ChunkName() FourCC { return EXIFChunk }
 
 // Parse 原样保留 EXIF 载荷，不作解释。/ Parse keeps the EXIF payload verbatim without interpreting it.
-func (e *EXIF) Parse(c *riffChunk) error {
-	e.Data = c.data
+func (e *EXIF) Parse(c *RawChunk) error {
+	e.Data = c.Data
 	return nil
 }
 
@@ -555,7 +555,7 @@ type XMP struct {
 func (x *XMP) ChunkName() FourCC { return XMPChunk }
 
 // Parse 原样保留 XMP 载荷，不作解释。/ Parse keeps the XMP payload verbatim without interpreting it.
-func (x *XMP) Parse(c *riffChunk) error {
-	x.Data = c.data
+func (x *XMP) Parse(c *RawChunk) error {
+	x.Data = c.Data
 	return nil
 }

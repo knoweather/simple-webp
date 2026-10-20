@@ -5,7 +5,7 @@
 
 [English](./README.md) | **简体中文**
 
-纯 Go 的 WebP 解析 / 解码 / 编码库——无 cgo、无第三方运行时依赖。容器解析、
+纯 Go 的 WebP 解析 / 解码 / 编码库——无 cgo；唯一的第三方模块是 `github.com/pkg/errors`（仅用于错误包裹），其余均为标准库。容器解析、
 VP8 有损解码、VP8L 无损解码+编码、ALPH 透明通道、动画合成，全部自己实现，
 输出标准 `image.Image`。
 

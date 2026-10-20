@@ -230,7 +230,7 @@ func (w *Webp) parseOne(c *riffChunk) (bool, error) {
 		target = w.ANIM
 	case ANMFChunk:
 		frame := &ANMF{}
-		if err := frame.Parse(c); err != nil {
+		if err := frame.Parse(&RawChunk{Name: c.name, Data: c.data}); err != nil {
 			return false, err
 		}
 		w.ANMFs = append(w.ANMFs, frame)
@@ -257,7 +257,7 @@ func (w *Webp) parseOne(c *riffChunk) (bool, error) {
 	default:
 		return false, nil
 	}
-	if err := target.Parse(c); err != nil {
+	if err := target.Parse(&RawChunk{Name: c.name, Data: c.data}); err != nil {
 		return false, err
 	}
 	w.markOrigConsumed(c)
@@ -330,7 +330,7 @@ func (w *Webp) ParseChunk(c ChunkParse, notSave ...bool) error {
 		if cur.name != c.ChunkName() {
 			continue
 		}
-		if err := c.Parse(cur); err != nil {
+		if err := c.Parse(&RawChunk{Name: cur.name, Data: cur.data}); err != nil {
 			return errors.WithStack(err)
 		}
 		w.chunks = append(w.chunks[:i], w.chunks[i+1:]...)

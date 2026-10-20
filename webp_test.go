@@ -220,8 +220,8 @@ func (c *customChunk) ChunkName() FourCC { return FourCC("ABCD") }
 // Parse 直接引用 chunk 的原始数据，不复制。
 //
 // Parse keeps a reference to the chunk's raw data without copying it.
-func (c *customChunk) Parse(chunk *riffChunk) error {
-	c.Data = chunk.data
+func (c *customChunk) Parse(chunk *RawChunk) error {
+	c.Data = chunk.Data
 	return nil
 }
 
