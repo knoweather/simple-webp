@@ -193,6 +193,26 @@ meta-Huffman / color transform yet).
   and VP8L (lossless, `VP8L` chunk). VP9 is a different codec used in
   WebM/Matroska containers and unrelated to this library
 
+## Roadmap
+
+The lossy encoder is intra only by design. Two changes would close most of what
+is left between it and `cwebp`, in order of value:
+
+- **Rate-distortion mode decision.** Modes are picked by SAD alone, which ignores
+  what the residual costs to code. Scoring the four luma and four chroma modes by
+  quantised distortion plus a rate estimate usually gains 5-15%, at the price of
+  running the forward transform and quantiser once per candidate, so encoding
+  becomes two to three times slower again.
+- **4x4 intra modes.** Only the 16x16 luma modes exist, so detailed and textured
+  regions are predicted from one direction across the whole macroblock. Adding
+  the ten 4x4 modes with their context-coded mode tree is the largest single
+  gain, and also the largest change: per-block prediction chaining, per-block
+  non-zero masks and a different handling of the Y2 block.
+
+The loop filter is deliberately absent from that list. This decoder filters after
+the whole frame, so filtering cannot improve prediction, and what it buys is
+subjective smoothness rather than PSNR at a given size.
+
 ## Safety / pixel budget
 
 To guard against decompression bombs (test data includes a few-dozen-byte
