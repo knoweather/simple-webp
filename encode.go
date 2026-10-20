@@ -15,10 +15,14 @@ import (
 //
 // EncodeOptions tunes the lossless encoder.
 type EncodeOptions struct {
-	// Lossless 仅为信息性字段：本库只写出无损 WebP，因此该值被接受但忽略。
+	// Lossless 仅为兼容保留：Encode 始终写出无损 WebP，需要有损输出请改用
+	// EncodeLossy。之所以不按该值分叉，是因为它的零值是 false——一旦生效，
+	// 所有没有显式设置它的调用方都会静默地从无损变成有损。
 	//
-	// Lossless is informational: this library only writes lossless webp, so
-	// the value is accepted and ignored.
+	// Lossless is kept for compatibility: Encode always writes lossless webp and
+	// EncodeLossy is the lossy entry point. The value is not honoured because
+	// its zero value is false, so making it meaningful would silently turn every
+	// caller that never set it into a lossy encoder.
 	Lossless bool
 	// Method 以速度换压缩率：0 只存储字面量，1 追加减绿（subtract green）
 	// 变换、颜色索引和 LZ77，2（默认）再应用预测器变换。

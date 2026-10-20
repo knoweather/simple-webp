@@ -173,7 +173,10 @@ meta-Huffman / color transform yet).
 
 ## Known limitations
 
-- `EncodeOptions.Lossless` is accepted but ignored: `Encode` always writes lossless (VP8L)
+- `EncodeOptions.Lossless` is accepted but ignored: `Encode` always writes
+  lossless (VP8L) and `EncodeLossy` is the lossy path. The flag cannot be honoured
+  as it stands because its zero value is `false`, so every caller that never set
+  it would silently switch to lossy
 - **Lossy encoding is intra only.** The VP8 encoder uses 16x16 luma and 8x8
   chroma modes with a fixed quantizer per frame, no 4x4 modes, no loop filter
   and no rate control. Output is a valid stream any VP8 decoder accepts, but at
