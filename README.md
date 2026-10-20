@@ -26,7 +26,7 @@ preserved, byte-exact write back.
 | image interface | ✅ | `ToImage()`, `*Webp` implements `image.Image`, `image.RegisterFormat("webp", ...)` |
 | Metadata editing | ✅ | rewrite with `ICCP`/`EXIF`/`XMP ` chunks, **pixels never re-encoded**, byte-exact when untouched |
 | VP8L lossless encode | ✅ | color-indexing / subtract-green / predictor / LZ77 / Huffman (≤15 bits) |
-| VP8 lossy encode | ❌ | out of scope (mode decision, RD optimization, rate control) |
+| VP8 lossy encode | ✅ | intra only: 16x16 luma + 8x8 chroma modes, one quantizer, no loop filter, no rate control |
 
 ## Install
 
@@ -93,6 +93,17 @@ err := simple_webp.Encode(out, img, &simple_webp.EncodeOptions{
 })
 ```
 
+Lossy output goes through the VP8 encoder:
+
+```go
+err := simple_webp.EncodeLossy(out, img, &simple_webp.LossyOptions{
+    Quality: 80, // 0 (smallest) .. 100 (best); 0 means the default, 75
+})
+```
+
+Lossy WebP carries luma and chroma only, so the alpha channel is dropped;
+`EncodeBytes` is the lossless path to use when transparency matters.
+
 ### Custom chunks
 
 The same extension point as simple-png:
@@ -147,6 +158,8 @@ Windows/amd64, Ryzen 7 7840HS, `go test -bench . -benchtime 1s`:
 | VP8L lossless decode (320×240) | 3.45 ms (22.3 MP/s) | 2.86 ms (26.9 MP/s) | 1.3–3.4× faster |
 | VP8 lossy decode, YUV only (400×300) | **1.02 ms** (117.8 MP/s) | 1.08 ms (111.4 MP/s) | — |
 | VP8 lossy decode + RGB (400×300) | 4.52 ms → **1.42 ms** (optimized, CT) | not supported | 0.208 ms (single-thread ≈ 6.8× slower) |
+| VP8 lossy encode (400×300) | 4.9 ms (24.6 MP/s) | not supported | — |
+| VP8 lossy encode (640×480) | 11.6 ms (26.4 MP/s) | not supported | — |
 
 > The libwebp column comes from a single thread on a different machine
 > (libwebp 1.5.0 `WebPDecodeRGBA`), scale reference only. Lossy decoding got a
@@ -160,7 +173,11 @@ meta-Huffman / color transform yet).
 
 ## Known limitations
 
-- **Lossy encoding** not implemented — `EncodeOptions.Lossless` is accepted but ignored: every encode path writes lossless (VP8L) only
+- `EncodeOptions.Lossless` is accepted but ignored: `Encode` always writes lossless (VP8L)
+- **Lossy encoding is intra only.** The VP8 encoder uses 16x16 luma and 8x8
+  chroma modes with a fixed quantizer per frame, no 4x4 modes, no loop filter
+  and no rate control. Output is a valid stream any VP8 decoder accepts, but at
+  the same PSNR it is roughly 1.5-2.5x the size `cwebp` produces
 - The encoder implements neither color transform nor meta-Huffman blocked
   coding, so compression is weaker than `cwebp`
 - `ALPH` `preprocessing=1` (level reduction) is passed through as-is, without

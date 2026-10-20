@@ -24,7 +24,7 @@ chunk 化、原始字节保留、可字节级回写。
 | image 接口 | ✅ | `ToImage()`、`*Webp` 实现 `image.Image`、`image.RegisterFormat("webp", ...)` |
 | 元数据编辑 | ✅ | 追加 `ICCP`/`EXIF`/`XMP ` 后回写，**不重编码像素**，未改动时字节级还原 |
 | VP8L 无损编码 | ✅ | 色彩索引 / subtract-green / predictor / LZ77 / Huffman（≤15 位） |
-| VP8 有损编码 | ❌ | 不在范围内（需要模式决策、RD 优化、码率控制） |
+| VP8 有损编码 | ✅ | 仅帧内：16x16 亮度 + 8x8 色度模式，整帧单一量化索引，不做环路滤波与码率控制 |
 
 ## 安装
 
@@ -91,6 +91,17 @@ err := simple_webp.Encode(out, img, &simple_webp.EncodeOptions{
 })
 ```
 
+有损输出走 VP8 编码器：
+
+```go
+err := simple_webp.EncodeLossy(out, img, &simple_webp.LossyOptions{
+    Quality: 80, // 0（体积最小）.. 100（质量最高）；0 表示取默认值 75
+})
+```
+
+有损格式只承载亮度与色度，alpha 通道会被丢弃；需要保留透明度时用
+`EncodeBytes` 走无损。
+
 ### 自定义 chunk
 
 与 simple-png 相同的扩展点：
@@ -152,6 +163,8 @@ Windows / amd64，Ryzen 7 7840HS，`go test -bench . -benchtime 1s`：
 | VP8L 无损解码（320×240） | 3.45 ms（22.3 MP/s） | 2.86 ms（26.9 MP/s） | 快 1.3–3.4× |
 | VP8 有损解码（400×300，仅 YUV） | **1.02 ms**（117.8 MP/s） | 1.08 ms（111.4 MP/s） | —（不单独拆 YUV） |
 | VP8 有损解码 + RGB 转换（400×300） | 4.52 ms（优化前）→ **1.42 ms**（优化后，CT） | 不支持 | 0.208 ms（单线程约慢 6.8×、10 核约慢 5.2×） |
+| VP8 有损编码（400×300） | 4.9 ms（24.6 MP/s） | 不支持 | — |
+| VP8 有损编码（640×480） | 11.6 ms（26.4 MP/s） | 不支持 | — |
 
 > libwebp 列来自另一台 CT（concast-go）的单线程基准（libwebp 1.5.0 的
 > `WebPDecodeRGBA`），与上方 Windows 表**不是同一台机器**，仅作量级对照。
@@ -165,7 +178,10 @@ color transform）。
 
 ## 已知限制
 
-- **有损编码**未实现，`EncodeOptions.Lossless` 被接受但忽略（只出 VP8L 无损）。
+- `EncodeOptions.Lossless` 被接受但忽略：`Encode` 只写 VP8L 无损。
+- **有损编码仅帧内**：VP8 编码器只用 16x16 亮度与 8x8 色度模式，整帧固定量化索引，
+  没有 4x4 模式、不做环路滤波、也没有码率控制。输出是任何 VP8 解码器都能解的合法码流，
+  但同 PSNR 下体积约为 `cwebp` 的 1.5~2.5 倍。
 - 编码器未实现 color transform 与 meta-Huffman 分块，压缩率低于 `cwebp`。
 - `ALPH` 的 `preprocessing=1`（level reduction）按原值输出，未做参考实现的抖动还原；
   cwebp 默认不产生该模式。
