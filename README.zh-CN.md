@@ -181,7 +181,7 @@ color transform）。
 - `EncodeOptions.Lossless` 被接受但忽略：`Encode` 只写 VP8L 无损。
 - **有损编码仅帧内**：VP8 编码器只用 16x16 亮度与 8x8 色度模式，整帧固定量化索引，
   没有 4x4 模式、不做环路滤波、也没有码率控制。输出是任何 VP8 解码器都能解的合法码流，
-  但同 PSNR 下体积约为 `cwebp` 的 1.5~2.5 倍。
+  但同质量下体积大于 `cwebp`（缺 4x4 模式与率失真优化）。
 - 编码器未实现 color transform 与 meta-Huffman 分块，压缩率低于 `cwebp`。
 - `ALPH` 的 `preprocessing=1`（level reduction）按原值输出，未做参考实现的抖动还原；
   cwebp 默认不产生该模式。

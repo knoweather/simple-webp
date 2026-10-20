@@ -2,9 +2,9 @@ package vp8
 
 // boolEncoder 是 boolDecoder 的逆运算，输出 RFC 6386 第 7 节的布尔编码码流。
 //
-// 与解码器一样使用“range 减一”以外的完整 range 表示，但状态以 24 位区间下界
-// low 为中心：解码器的值窗口只保留 16 位前瞻，区间大小按 range<<8 计，所以编码
-// 侧把 low 的有效宽度维持在 24 位，每凑满 8 位就定稿一个字节。
+// 编码器保存完整的 range（解码器存的是 range-1），状态以 24 位区间下界 low 为
+// 中心：解码器的值窗口只保留 16 位前瞻，区间大小按 range<<8 计，所以 low 的有效
+// 宽度维持在 24 位，每凑满 8 位就定稿一个字节。
 //
 // count 记录自上次定稿以来累积的归一化位数，初值 -24 对应“窗口还空着 24 位”。
 // 一旦 count 越过 0，说明 low 的高 8 位已经稳定，可以写出；若该字节的进位位
@@ -14,10 +14,10 @@ package vp8
 // boolEncoder is the inverse of boolDecoder and emits the boolean-coded stream
 // of section 7 of RFC 6386.
 //
-// The state is centred on low, the 24 bit low end of the interval: the decoder
-// keeps only 16 bits of lookahead and measures the interval as range<<8, so the
-// encoder holds low at 24 significant bits and finalises one byte each time
-// eight bits have accumulated.
+// The encoder keeps the full range (the decoder stores range-1) and centres its
+// state on low, the 24 bit low end of the interval: the decoder keeps only 16
+// bits of lookahead and measures the interval as range<<8, so low is held at 24
+// significant bits and one byte is finalised each time eight bits accumulate.
 //
 // count tracks the normalisation bits accumulated since the last finalised
 // byte, starting at -24 for the empty window. Once count reaches zero the top
