@@ -54,3 +54,26 @@ func BenchmarkXImageDecodeFrame(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkEncodeLossy 测量 16x16 帧内编码器在 400x300 与 VGA 尺寸下的耗时。
+//
+// BenchmarkEncodeLossy measures the 16x16 intra encoder at 400x300 and VGA.
+func BenchmarkEncodeLossy400x300(b *testing.B) {
+	img := testImage(400, 300)
+	b.SetBytes(int64(400 * 300))
+	for i := 0; i < b.N; i++ {
+		if _, err := Encode(img, 75); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkEncodeLossyVGA(b *testing.B) {
+	img := testImage(640, 480)
+	b.SetBytes(int64(640 * 480))
+	for i := 0; i < b.N; i++ {
+		if _, err := Encode(img, 75); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
