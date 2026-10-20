@@ -196,26 +196,6 @@ func (e *encoder) evalLuma4Block(n, x, y, ctx int, prob *[9]uint8, lambda float6
 	return bestCost, bestMode, bestNZ
 }
 
-// sadPlane 返回 n x n 块内两个平面的绝对差之和。
-//
-// sadPlane returns the sum of absolute differences between two planes over an
-// n x n block.
-func sadPlane(a, b *plane, x, y, n int) int {
-	s := 0
-	for j := 0; j < n; j++ {
-		ai := a.at(x, y+j)
-		bi := b.at(x, y+j)
-		for i := 0; i < n; i++ {
-			d := int(a.pix[ai+i]) - int(b.pix[bi+i])
-			if d < 0 {
-				d = -d
-			}
-			s += d
-		}
-	}
-	return s
-}
-
 // blockIsNonZero 报告第 n 个 4x4 块是否有非零系数。
 //
 // blockIsNonZero reports whether the n-th 4x4 block carries non-zero

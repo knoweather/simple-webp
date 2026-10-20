@@ -671,28 +671,6 @@ func (e *encoder) residual(pred, src *plane, x, y int, out *[16]int32) {
 	}
 }
 
-// loadCoeffs 把当前宏块的系数全部反量化进解码器的系数缓冲：16x16 模式下
-// Y2 走逆 WHT 分散到 16 个亮度块，4x4 模式下每个亮度块自带 DC。
-//
-// loadCoeffs dequantizes the levels of the current macroblock into the
-// decoder's coefficient buffer: with a 16x16 mode the Y2 block goes through the
-// inverse Walsh-Hadamard transform, which scatters the DC values into the
-// sixteen luma blocks, with 4x4 modes every luma block carries its own DC.
-func (e *encoder) loadCoeffs() {
-	d := &e.d
-	for i := range d.coeff {
-		d.coeff[i] = 0
-	}
-	if d.usePredY16 {
-		e.loadCoeffsLuma16()
-	} else {
-		for n := 0; n < 16; n++ {
-			e.loadCoeffsLuma4(n)
-		}
-	}
-	e.loadCoeffsChroma()
-}
-
 // loadCoeffsLuma16 把 Y2 与亮度块的系数反量化进解码器的系数缓冲，Y2 走逆 WHT
 // 分散到 16 个亮度块。
 //
@@ -750,26 +728,6 @@ func (e *encoder) loadCoeffsChroma() {
 			d.coeff[320+16*c+z] = int16(e.levels[320+16*c+z] * int32(qq))
 		}
 	}
-}
-
-// setMasks 依据反量化后的系数算出 DC 与 AC 非零掩码，供逆变换选择完整 IDCT
-// 或仅 DC 的快路径。
-//
-// setMasks derives the non-zero DC and AC masks from the dequantized
-// coefficients, which the inverse transform uses to choose between the full
-// IDCT and the DC-only fast path.
-func (e *encoder) setMasks() {
-	d := &e.d
-	d.nzDCMask = 0
-	d.nzACMask = 0
-	if d.usePredY16 {
-		e.setMasksLuma16()
-	} else {
-		for n := 0; n < 16; n++ {
-			e.setMasksLuma4(n)
-		}
-	}
-	e.setMasksChroma()
 }
 
 // setMasksLuma16 算出 16 个亮度块的 DC 与 AC 非零掩码。

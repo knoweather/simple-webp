@@ -35,37 +35,47 @@ func TestEncodeUses4x4Modes(t *testing.T) {
 // decoder. An independent implementation confirms the mode tree, the contexts
 // and the propagation of the non-zero flags.
 func TestEncode4x4IndependentDecoder(t *testing.T) {
-	src := testImage(96, 72)
-	e := newEncoder(96, 72, src, 75)
-	data := e.run()
-	if e.y4Blocks == 0 {
-		t.Fatal("the stream did not use the 4x4 mode path")
-	}
-	ours, err := Decode(data)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	img, err := xwebp.Decode(bytes.NewReader(wrapWebP(data)))
-	if err != nil {
-		t.Fatalf("x/image/webp decode: %v", err)
-	}
-	ref, ok := img.(*image.YCbCr)
-	if !ok {
-		t.Fatalf("x/image/webp returned %T", img)
-	}
-	for y := 0; y < ours.Rect.Dy(); y++ {
-		for x := 0; x < ours.Rect.Dx(); x++ {
-			if a, b := ours.Y[y*ours.YStride+x], ref.Y[y*ref.YStride+x]; a != b {
-				t.Fatalf("luma mismatch at (%d,%d): %d != %d", x, y, a, b)
+	for _, tc := range []struct {
+		w, h    int
+		quality int
+	}{
+		{96, 72, 40}, {96, 72, 75}, {96, 72, 95},
+		{64, 64, 60}, {48, 33, 85}, {129, 97, 70},
+	} {
+		src := testImage(tc.w, tc.h)
+		e := newEncoder(tc.w, tc.h, src, tc.quality)
+		data := e.run()
+		if e.y4Blocks == 0 {
+			t.Fatalf("%dx%d q=%d: the stream did not use the 4x4 mode path", tc.w, tc.h, tc.quality)
+		}
+		ours, err := Decode(data)
+		if err != nil {
+			t.Fatalf("%dx%d q=%d: decode: %v", tc.w, tc.h, tc.quality, err)
+		}
+		img, err := xwebp.Decode(bytes.NewReader(wrapWebP(data)))
+		if err != nil {
+			t.Fatalf("%dx%d q=%d: x/image/webp decode: %v", tc.w, tc.h, tc.quality, err)
+		}
+		ref, ok := img.(*image.YCbCr)
+		if !ok {
+			t.Fatalf("%dx%d q=%d: x/image/webp returned %T", tc.w, tc.h, tc.quality, img)
+		}
+		for y := 0; y < ours.Rect.Dy(); y++ {
+			for x := 0; x < ours.Rect.Dx(); x++ {
+				if a, b := ours.Y[y*ours.YStride+x], ref.Y[y*ref.YStride+x]; a != b {
+					t.Fatalf("%dx%d q=%d: luma mismatch at (%d,%d): %d != %d",
+						tc.w, tc.h, tc.quality, x, y, a, b)
+				}
 			}
 		}
-	}
-	cw, ch := (ours.Rect.Dx()+1)/2, (ours.Rect.Dy()+1)/2
-	for y := 0; y < ch; y++ {
-		for x := 0; x < cw; x++ {
-			if ours.Cb[y*ours.CStride+x] != ref.Cb[y*ref.CStride+x] ||
-				ours.Cr[y*ours.CStride+x] != ref.Cr[y*ref.CStride+x] {
-				t.Fatalf("chroma mismatch at (%d,%d)", x, y)
+		cw, ch := (ours.Rect.Dx()+1)/2, (ours.Rect.Dy()+1)/2
+		for y := 0; y < ch; y++ {
+			for x := 0; x < cw; x++ {
+				if ours.Cb[y*ours.CStride+x] != ref.Cb[y*ref.CStride+x] ||
+					ours.Cr[y*ours.CStride+x] != ref.Cr[y*ref.CStride+x] {
+					t.Fatalf("%dx%d q=%d: chroma mismatch at (%d,%d)",
+						tc.w, tc.h, tc.quality, x, y)
+				}
 			}
 		}
 	}
