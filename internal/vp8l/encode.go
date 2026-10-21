@@ -66,6 +66,33 @@ func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 		method = opt.Method
 		colorCache = !opt.DisableColorCache
 	}
+	if method < 2 {
+		return encodeStream(pix, width, height, method, colorCache, false)
+	}
+	// 颜色变换未必总是划算：两种写法各编码一次，留下更短的那个。
+	// The colour transform does not always pay off: encode both variants and keep
+	// the shorter stream.
+	plain, err := encodeStream(pix, width, height, method, colorCache, false)
+	if err != nil {
+		return nil, err
+	}
+	withColor, err := encodeStream(pix, width, height, method, colorCache, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(withColor) < len(plain) {
+		return withColor, nil
+	}
+	return plain, nil
+}
+
+// encodeStream 按给定策略编码一份完整码流（含 5 字节流头）。useColorTransform
+// 为 true 时在减绿与预测器之前先施加颜色变换。
+//
+// encodeStream encodes one complete bitstream (the 5-byte header included) for
+// the given strategy. With useColorTransform it applies the colour transform
+// before subtract green and the predictor.
+func encodeStream(pix []uint32, width, height, method int, colorCache, useColorTransform bool) ([]byte, error) {
 	e := &encoder{}
 	e.useColorCache = method >= 1 && colorCache
 	e.w.writeBits(0x2f, 8)
@@ -82,6 +109,11 @@ func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 			e.writeColorIndexing(palette, curW, curH)
 			cur, curW = indices, packedW
 		} else {
+			if useColorTransform {
+				residuals, coeffs := forwardColor(cur, curW, curH, colorTransformBits)
+				e.writeColorTransform(coeffs, curW, curH, colorTransformBits)
+				cur = residuals
+			}
 			e.w.writeBits(1, 1) // 变换标志：1 表示还有变换 / transform flag: 1 means a transform follows
 			e.w.writeBits(transformSubtractGreen, 2)
 			cur = subtractGreen(cur)
@@ -108,6 +140,150 @@ func alphaUsed(pix []uint32) uint32 {
 		}
 	}
 	return 0
+}
+
+// colorTransformBits 是颜色变换的块边长指数：每块 16×16 像素。
+//
+// colorTransformBits is the block size exponent of the colour transform: 16 by
+// 16 pixels per block.
+const colorTransformBits = 4
+
+// absInt8 返回 int8 的绝对值。
+//
+// absInt8 returns the absolute value of an int8.
+func absInt8(v int8) int64 {
+	if v < 0 {
+		return int64(-int(v))
+	}
+	return int64(v)
+}
+
+// searchColorCoeff 由粗到细搜索一个颜色变换系数：先按步长 16 扫遍 [-128,127]，
+// 再在最优值附近按步长 4 与步长 1 细化，取残差绝对值之和最小的那个。
+//
+// searchColorCoeff searches a colour transform coefficient coarse to fine: it
+// scans [-128,127] in steps of 16, then refines around the best value in steps of
+// 4 and 1, keeping the coefficient with the smallest residual magnitude.
+func searchColorCoeff(cost func(t int8) int64) int8 {
+	best, bestCost := int8(0), int64(1)<<62
+	consider := func(t int) {
+		if t < -128 || t > 127 {
+			return
+		}
+		if c := cost(int8(t)); c < bestCost {
+			bestCost, best = c, int8(t)
+		}
+	}
+	for t := -128; t <= 127; t += 16 {
+		consider(t)
+	}
+	center := int(best)
+	for t := center - 15; t <= center+15; t += 4 {
+		consider(t)
+	}
+	center = int(best)
+	for t := center - 3; t <= center+3; t++ {
+		consider(t)
+	}
+	return best
+}
+
+// colorSample 返回估算系数时的采样步长：每隔 4 个像素取一个，既省时间又足够
+// 反映整幅图的相关性。
+//
+// colorSample is the stride used while estimating coefficients: every fourth
+// pixel is sampled, which is cheap and still represents the image.
+const colorSample = 4
+
+// forwardColor 估计颜色变换系数并返回残差图。系数由绿色通道分别预测红、蓝，
+// 再用修正后的红预测蓝；这些系数在整幅图上共用，按解码端的块布局重复写出。
+// 打包方式为 0xAARRGGBB：R 存 red_to_blue、G 存 green_to_blue、B 存
+// green_to_red。
+//
+// forwardColor estimates the colour transform coefficients and returns the
+// residual image. Green predicts red and blue, and the corrected red predicts
+// blue; one coefficient set is shared by the whole image and repeated over the
+// block layout the decoder expects. The packing is 0xAARRGGBB with
+// R = red_to_blue, G = green_to_blue and B = green_to_red.
+func forwardColor(pix []uint32, width, height, bits int) ([]uint32, []uint32) {
+	n := width * height
+	greenToRed := searchColorCoeff(func(t int8) int64 {
+		var cost int64
+		for i := 0; i < n; i += colorSample {
+			p := pix[i]
+			g := int8(p >> 8)
+			r := int8(p >> 16)
+			cost += absInt8(r - int8(colorDelta(t, g)))
+		}
+		return cost
+	})
+	greenToBlue := searchColorCoeff(func(t int8) int64 {
+		var cost int64
+		for i := 0; i < n; i += colorSample {
+			p := pix[i]
+			g := int8(p >> 8)
+			b := int8(p)
+			cost += absInt8(b - int8(colorDelta(t, g)))
+		}
+		return cost
+	})
+	redToBlue := searchColorCoeff(func(t int8) int64 {
+		var cost int64
+		for i := 0; i < n; i += colorSample {
+			p := pix[i]
+			g := int8(p >> 8)
+			// 解码端的红蓝预测用的是「重建后」的红，也就是原始红；残差红只在
+			// 比特流内部使用。
+			// The decoder predicts blue from the reconstructed red, which is the
+			// original one; the red residual only exists inside the bitstream.
+			r := int8(p >> 16)
+			b := int8(uint8(int8(p) - int8(colorDelta(greenToBlue, g))))
+			cost += absInt8(b - int8(colorDelta(t, r)))
+		}
+		return cost
+	})
+
+	blockWidth := divRoundUp(width, 1<<bits)
+	if blockWidth <= 0 {
+		blockWidth = 1
+	}
+	blockHeight := divRoundUp(height, 1<<bits)
+	coeff := 0xff000000 | uint32(uint8(redToBlue))<<16 |
+		uint32(uint8(greenToBlue))<<8 | uint32(uint8(greenToRed))
+	coeffs := make([]uint32, blockWidth*blockHeight)
+	for i := range coeffs {
+		coeffs[i] = coeff
+	}
+
+	out := make([]uint32, n)
+	for i := 0; i < n; i++ {
+		p := pix[i]
+		green := int8(p >> 8)
+		red := int32(p>>16) & 0xff
+		blue := int32(p) & 0xff
+		// 红先用绿做修正，蓝的 red_to_blue 项要用「重建后」的红（即原始红），
+		// 与解码端的顺序完全一致。
+		// Red is corrected with green first; the blue red_to_blue term uses the
+		// reconstructed red (the original one), exactly like the decoder.
+		redResidual := (red - int32(colorDelta(greenToRed, green))) & 0xff
+		blue = (blue - int32(colorDelta(greenToBlue, green))) & 0xff
+		blue = (blue - int32(colorDelta(redToBlue, int8(red)))) & 0xff
+		out[i] = p&0xff00ff00 | uint32(redResidual)<<16 | uint32(blue)
+	}
+	return out, coeffs
+}
+
+// writeColorTransform 写出颜色变换：变换类型、块边长指数，再把每个块的系数
+// 当作一张普通熵编码子图写出来。
+//
+// writeColorTransform writes the colour transform: the transform type, the block
+// size exponent, and the per block coefficients as a plain entropy coded
+// sub-image.
+func (e *encoder) writeColorTransform(coeffs []uint32, width, height, bits int) {
+	e.w.writeBits(1, 1) // 变换标志：1 表示还有变换 / transform flag: 1 means a transform follows
+	e.w.writeBits(transformColor, 2)
+	e.w.writeBits(uint32(bits-2), 3)
+	e.writeEntropyImage(coeffs, divRoundUp(width, 1<<bits), divRoundUp(height, 1<<bits), false)
 }
 
 // subtractGreen 返回减绿变换后的像素：R、B 两通道各自减去 G（模 256），
