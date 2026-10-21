@@ -73,6 +73,14 @@ var buf bytes.Buffer
 _, err := w.WriteTo(&buf)   // 未改动的 chunk 逐字节复制，像素数据不重编码
 ```
 
+新 chunk 按容器规范给该类型规定的位置插入：`VP8X` 最前，`ICCP` 紧随其后、排在
+`ANIM`、`ANMF` 与图像数据之前，`ANIM` 在第一个 `ANMF` 之前，`ALPH` 在 `VP8 `/`VP8L`
+之前，`EXIF`、`XMP` 与未知类型排在末尾。`DeleteRawChunk` 也能删掉解析时已被消费的
+`ALPH`、`ANIM`、`ANMF`、`VP8X`、`VP8`、`VP8L`，并同步清除 `VP8X` 的标志位；会让
+文件变成非法流的删除（唯一的图像数据、还有帧时删 `ANIM`、还有扩展特性时删 `VP8X`）
+一律不生效：什么都不删，返回 0。`ANMF` 帧内的未知子 chunk 保持原位置，帧级应用
+数据经解析、写回后不丢。
+
 ### 动画
 
 ```go
@@ -203,6 +211,8 @@ color transform）。
   cwebp 默认不产生该模式。
 - 无损解码的 Huffman 是逐位解码，大图比参考实现慢约 20%。
 - 动画只读不写。
+- `DeleteRawChunk` 只返回删掉了几个 chunk，不说明为什么没删：返回 0 表示该类型
+  根本不存在，或者删除会让文件变成非法流而未被接受。
 - **WebP 不含 VP9**：WebP 的两种编码是 VP8（有损，`VP8` chunk）与 VP8L（无损，`VP8L` chunk）。
   VP9 是另一种编码，只用在 WebM/Matroska 容器里，与本库无关。
 
@@ -224,7 +234,11 @@ color transform）。
 
 - `DecodeOptions.MaxPixels`（默认 `1<<27` ≈ 1.34 亿像素，约 512 MB ARGB）会透传到
   `vp8.DecodeLimit` / `vp8l.DecodeARGBLimit`；超过预算返回 `ErrTooLarge` / `ErrImageTooLarge`。
-- 单 chunk 体积由 `maxChunkSize` 兜底。
+- chunk 载荷按实际到达的字节流式读入，不再按声明长度预分配：几十字节、只含一个声明
+  1 GB 的 chunk 头的文件会直接失败，不会有那次分配；声明长度大于实际数据时按截断报错，
+  而不是当成流正常结束。
+- RIFF File Size 之后的数据一律忽略（规范允许）；`verifySize` 仍会拒绝大小字段与
+  实际长度不符的流。
 - 已用 `TestToImageWithDefaultBudget` 单测 + 单 worker fuzz 验证：最大声明头被零分配拒绝，
   不会触发 OOM。
 
@@ -245,11 +259,15 @@ img, err := w.ToImageWith(simple_webp.DecodeOptions{MaxPixels: 4096 * 4096})
   `wasm/example/main.wasm` 与复制好的 `wasm_exec.js`。
 - JS API（由 `wasm.Register()` 安装到全局对象）：
   - `webpDecode(bytes) -> { width, height, hasAlpha, hasAnimation, rgba }`
-    （失败返回 `{ error }`）
-  - `webpInfo(bytes)   -> { width, height, hasAlpha, hasAnimation }`（不解码像素）
+    （失败返回 `{ error }`；动画取第一帧）
+  - `webpDecodeFrames(bytes) -> [ { width, height, duration, rgba }, … ]`
+    （全部动画帧，按画布尺寸；静态图返回一帧）
+  - `webpInfo(bytes) -> { width, height, hasAlpha, hasAnimation, hasICC,
+    hasEXIF, hasXMP, frameCount }`（不解码像素；VP8X 标志位 + 帧数）
   - `bytes` 可传 `Uint8Array` 或 `ArrayBuffer`；`rgba` 为直通 alpha 的
     `Uint8Array`，须同步消费（Go 托管内存）。
-- 完整示例：`wasm/example/index.html` 与 `wasm/README.md`。
+- 解码覆盖完整扩展格式：VP8X alpha（无损与有损 `VP8X+ALPH`）、动画（`VP8X+ANIM+ANMF`），
+  以及 ICC/EXIF/XMP 元数据标志。完整示例：`wasm/example/index.html` 与 `wasm/README.md`。
 
 ---
 

@@ -76,6 +76,17 @@ var buf bytes.Buffer
 _, err := w.WriteTo(&buf) // untouched chunks are copied byte for byte, pixels not re-encoded
 ```
 
+New chunks go where the container spec puts their type: `VP8X` first, `ICCP`
+right after it and before `ANIM`, `ANMF` and the image data, `ANIM` before the
+first `ANMF`, `ALPH` before `VP8 `/`VP8L`, and `EXIF`, `XMP` or unknown types at
+the end. `DeleteRawChunk` also removes the chunks parsing already consumed
+(`ALPH`, `ANIM`, `ANMF`, `VP8X`, `VP8`, `VP8L`) and clears the matching `VP8X`
+flags. A removal that would leave the file invalid — the only image data,
+`ANIM` while frames remain, `VP8X` while an extended feature remains — is
+refused: nothing is deleted and the call returns 0. Unknown sub-chunks inside an
+`ANMF` frame keep their original position, so frame-level application data
+survives a parse/write cycle.
+
 ### Animation
 
 ```go
@@ -214,6 +225,9 @@ meta-Huffman / color transform yet).
   the reference dithering; cwebp does not produce that mode by default
 - Lossless Huffman decodes bit by bit — large images ~20% slower than the reference
 - Animation is read-only (no animation encoder)
+- `DeleteRawChunk` reports how many chunks it removed but not why a removal was
+  refused: 0 means either no chunk of that type was present or the removal would
+  have left the file invalid
 - **WebP contains no VP9**: WebP's two codecs are VP8 (lossy, `VP8 ` chunk)
   and VP8L (lossless, `VP8L` chunk). VP9 is a different codec used in
   WebM/Matroska containers and unrelated to this library
@@ -240,7 +254,12 @@ budget **after reading the header and before allocating pixel buffers**:
 - `DecodeOptions.MaxPixels` (default `1<<27` ≈ 134M pixels ≈ 512 MB ARGB) is
   forwarded to `vp8.DecodeLimit` / `vp8l.DecodeARGBLimit`; exceeding it
   returns `ErrTooLarge` / `ErrImageTooLarge`
-- single chunk size is capped by `maxChunkSize`
+- a chunk payload is streamed into a growing buffer instead of being allocated
+  from its declared length, so a tiny file whose only chunk claims 1 GB fails
+  without that allocation; a chunk that promises more data than the stream
+  holds is an error rather than a silent end of stream
+- data after the RIFF File Size is ignored, as the spec allows; `verifySize`
+  still rejects a stream whose size field does not match the actual length
 - covered by `TestToImageWithDefaultBudget` and single-worker fuzzing: the
   worst-case bogus header is rejected with zero allocations, no OOM
 
