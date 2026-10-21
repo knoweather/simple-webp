@@ -5,12 +5,15 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/knoweather/simple-webp/internal/vp8"
 	"github.com/knoweather/simple-webp/internal/vp8l"
 )
 
-// PixelFormat 选择解码结果的像素布局。
+// PixelFormat 选择解码结果的像素布局：NRGBA（默认）、RGBA，或有损码流的
+// YCbCr 平面。
 //
-// PixelFormat selects the pixel layout of the decoded image.
+// PixelFormat selects the pixel layout of the decoded image: NRGBA (the
+// default), RGBA, or the YCbCr planes of a lossy bitstream.
 type PixelFormat int
 
 const (
@@ -24,6 +27,14 @@ const (
 	//
 	// PixelFormatRGBA returns an *image.RGBA, the premultiplied layout.
 	PixelFormatRGBA
+	// PixelFormatYCbCr 返回有损码流解码得到的 *image.YCbCr（4:2:0），不做 YUV→RGB
+	// 转换。无损码流、带 alpha 平面的图以及动画没有 YCbCr 表示，会返回 ErrUnsupported。
+	//
+	// PixelFormatYCbCr returns the *image.YCbCr (4:2:0) planes decoded from a
+	// lossy bitstream without a YUV to RGB conversion. Lossless bitstreams,
+	// images with an alpha plane and animations have no YCbCr representation and
+	// return ErrUnsupported.
+	PixelFormatYCbCr
 )
 
 // defaultMaxPixels 限制解码图像的最大像素数：1<<27 个像素约为 11585×11585
@@ -37,9 +48,12 @@ const defaultMaxPixels = 1 << 27
 //
 // DecodeOptions tunes the pixel decoding.
 type DecodeOptions struct {
-	// Format 选择返回的像素布局。
+	// Format 选择返回的像素布局。PixelFormatYCbCr 只适用于没有 alpha 平面的
+	// 静态有损码流，其余情况返回 ErrUnsupported。
 	//
-	// Format selects the returned pixel layout.
+	// Format selects the returned pixel layout. PixelFormatYCbCr applies only to
+	// a still lossy bitstream without an alpha plane; other cases return
+	// ErrUnsupported.
 	Format PixelFormat
 	// Frame 选择动画文件的帧，0 表示第一帧。
 	//
@@ -74,6 +88,10 @@ func (w *Webp) ToImageWith(opt DecodeOptions) (image.Image, error) {
 		return nil, errors.Wrapf(ErrImageTooLarge, "%dx%d", w.Width, w.Height)
 	}
 
+	if opt.Format == PixelFormatYCbCr {
+		return w.ycbcrImage(maxPixels)
+	}
+
 	if w.HasAnimation {
 		frames, _, err := w.Frames(maxPixels)
 		if err != nil {
@@ -90,6 +108,28 @@ func (w *Webp) ToImageWith(opt DecodeOptions) (image.Image, error) {
 		return nil, err
 	}
 	return toPixelFormat(img, opt.Format), nil
+}
+
+// ycbcrImage 返回有损码流的 YCbCr 平面。动画、无损码流与带 alpha 的图都无法用
+// YCbCr 表示，返回 ErrUnsupported。
+//
+// ycbcrImage returns the YCbCr planes of a lossy bitstream. Animations,
+// lossless bitstreams and images with an alpha plane have no YCbCr
+// representation and return ErrUnsupported.
+func (w *Webp) ycbcrImage(maxPixels int) (image.Image, error) {
+	if w.HasAnimation {
+		return nil, errors.Wrap(ErrUnsupported, "YCbCr output for an animation")
+	}
+	if w.VP8L != nil {
+		return nil, errors.Wrap(ErrUnsupported, "YCbCr output for a lossless bitstream")
+	}
+	if w.ALPH != nil {
+		return nil, errors.Wrap(ErrUnsupported, "YCbCr output with an alpha plane")
+	}
+	if w.VP8 == nil {
+		return nil, errors.New("webp: no image data")
+	}
+	return vp8.DecodeLimit(w.VP8.Data, maxPixels)
 }
 
 // decodeStill 解码单张静态图：优先无损码流，否则解码有损码流并叠加可选的

@@ -2,6 +2,7 @@ package simple_webp
 
 import (
 	"image"
+	"image/color"
 
 	"github.com/pkg/errors"
 )
@@ -34,6 +35,54 @@ type FrameOptions struct {
 	MaxTotalPixels int
 }
 
+// AnimationInfo 描述一段动画的画布参数与帧数，不涉及像素解码。
+//
+// AnimationInfo describes the canvas parameters and the frame count of an
+// animation without decoding any pixels.
+type AnimationInfo struct {
+	// Width、Height 是画布的像素尺寸。/ Width and Height are the canvas size in pixels.
+	Width, Height int
+	// BackgroundColor 是 ANIM 声明的背景色（straight alpha）。
+	// BackgroundColor is the background colour ANIM declares (straight alpha).
+	BackgroundColor color.NRGBA
+	// LoopCount 是最后一帧之后的循环次数，0 表示无限循环。
+	// LoopCount is how often playback repeats after the last frame; 0 loops forever.
+	LoopCount uint16
+	// FrameCount 是 ANMF 帧的数量。/ FrameCount is the number of ANMF frames.
+	FrameCount int
+}
+
+// frameLimits 校验画布与「画布 × 帧数」预算，返回交给子解码器的像素上限。
+// 超限返回 ErrImageTooLarge，任何像素缓冲都不会被分配。
+//
+// frameLimits checks the canvas and the canvas-times-frames budgets and returns
+// the pixel cap for the sub-decoders. Exceeding a budget returns
+// ErrImageTooLarge before any pixel buffer is allocated.
+func (w *Webp) frameLimits(opt FrameOptions, frames int) (int, error) {
+	if len(w.ANMFs) == 0 {
+		return 0, errors.New("webp: not an animated file")
+	}
+	maxPixels := opt.MaxPixels
+	if maxPixels <= 0 {
+		maxPixels = defaultMaxPixels
+	}
+	if w.Width <= 0 || w.Height <= 0 {
+		return 0, errors.Errorf("webp: bad canvas size %dx%d", w.Width, w.Height)
+	}
+	canvasPixels := int64(w.Width) * int64(w.Height)
+	if canvasPixels > int64(maxPixels) {
+		return 0, errors.Wrapf(ErrImageTooLarge, "%dx%d canvas", w.Width, w.Height)
+	}
+	maxTotal := opt.MaxTotalPixels
+	if maxTotal <= 0 {
+		maxTotal = defaultMaxTotalPixels
+	}
+	if canvasPixels*int64(frames) > int64(maxTotal) {
+		return 0, errors.Wrapf(ErrImageTooLarge, "%dx%d canvas x %d frames", w.Width, w.Height, frames)
+	}
+	return maxPixels, nil
+}
+
 // Frames 逐帧解码动图，返回按画布尺寸合成的各帧（NRGBA）及其显示时长
 // （毫秒）。maxPixels 像素预算同时约束画布尺寸与单帧解码规模，0 表示
 // defaultMaxPixels；等价于 FramesWith(FrameOptions{MaxPixels: maxPixels})。
@@ -57,26 +106,9 @@ func (w *Webp) Frames(maxPixels int) ([]*image.NRGBA, []int, error) {
 // the canvas-times-frames total are checked against the budget before any pixel
 // buffer is allocated; exceeding it returns ErrImageTooLarge.
 func (w *Webp) FramesWith(opt FrameOptions) ([]*image.NRGBA, []int, error) {
-	if len(w.ANMFs) == 0 {
-		return nil, nil, errors.New("webp: not an animated file")
-	}
-	maxPixels := opt.MaxPixels
-	if maxPixels <= 0 {
-		maxPixels = defaultMaxPixels
-	}
-	if w.Width <= 0 || w.Height <= 0 {
-		return nil, nil, errors.Errorf("webp: bad canvas size %dx%d", w.Width, w.Height)
-	}
-	canvasPixels := int64(w.Width) * int64(w.Height)
-	if canvasPixels > int64(maxPixels) {
-		return nil, nil, errors.Wrapf(ErrImageTooLarge, "%dx%d canvas", w.Width, w.Height)
-	}
-	maxTotal := opt.MaxTotalPixels
-	if maxTotal <= 0 {
-		maxTotal = defaultMaxTotalPixels
-	}
-	if canvasPixels*int64(len(w.ANMFs)) > int64(maxTotal) {
-		return nil, nil, errors.Wrapf(ErrImageTooLarge, "%dx%d canvas x %d frames", w.Width, w.Height, len(w.ANMFs))
+	maxPixels, err := w.frameLimits(opt, len(w.ANMFs))
+	if err != nil {
+		return nil, nil, err
 	}
 
 	canvas := image.NewNRGBA(image.Rect(0, 0, w.Width, w.Height))
@@ -100,6 +132,72 @@ func (w *Webp) FramesWith(opt FrameOptions) ([]*image.NRGBA, []int, error) {
 		}
 	}
 	return frames, durations, nil
+}
+
+// FrameAt 只合成到第 i 帧（0 起）并返回该帧与它的显示时长：中间帧不克隆，
+// 因此内存只需要一块画布，而不是「帧数 × 画布」。像素预算与 FramesWith 相同，
+// 总量按 i+1 帧计算；i 越界返回错误。
+//
+// FrameAt composites only up to frame i (zero based) and returns that frame and
+// its display duration. The intermediate frames are never cloned, so one canvas
+// is enough instead of frames times canvas. The budgets are the ones of
+// FramesWith, with the total counted over i+1 frames; an out-of-range index is
+// an error.
+func (w *Webp) FrameAt(i int, opt FrameOptions) (*image.NRGBA, int, error) {
+	if i < 0 || i >= len(w.ANMFs) {
+		return nil, 0, errors.Errorf("webp: frame %d out of range (%d frames)", i, len(w.ANMFs))
+	}
+	maxPixels, err := w.frameLimits(opt, i+1)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	canvas := image.NewNRGBA(image.Rect(0, 0, w.Width, w.Height))
+	for n := 0; n <= i; n++ {
+		f := w.ANMFs[n]
+		img, err := w.decodeStill(f.VP8, f.VP8L, f.ALPH, maxPixels)
+		if err != nil {
+			return nil, 0, errors.Wrapf(err, "webp: frame at %d,%d", f.X, f.Y)
+		}
+		blendFrame(canvas, img, f)
+		if n == i {
+			return cloneNRGBA(canvas), f.Duration, nil
+		}
+		if f.Dispose {
+			bg := uint32(0)
+			if w.ANIM != nil {
+				bg = w.ANIM.BackgroundColor
+			}
+			clearFrame(canvas, f, bg)
+		}
+	}
+	return nil, 0, errors.Errorf("webp: frame %d out of range (%d frames)", i, len(w.ANMFs))
+}
+
+// AnimationInfo 返回动画的画布尺寸、背景色、循环次数与帧数；非动画文件返回错误。
+//
+// AnimationInfo returns the canvas size, background colour, loop count and frame
+// count of the animation; a non-animated file is an error.
+func (w *Webp) AnimationInfo() (AnimationInfo, error) {
+	if len(w.ANMFs) == 0 {
+		return AnimationInfo{}, errors.New("webp: not an animated file")
+	}
+	info := AnimationInfo{
+		Width:      w.Width,
+		Height:     w.Height,
+		FrameCount: len(w.ANMFs),
+	}
+	if w.ANIM != nil {
+		bg := w.ANIM.BackgroundColor
+		info.BackgroundColor = color.NRGBA{
+			R: byte(bg >> 16),
+			G: byte(bg >> 8),
+			B: byte(bg),
+			A: byte(bg >> 24),
+		}
+		info.LoopCount = w.ANIM.LoopCount
+	}
+	return info, nil
 }
 
 // blendFrame 按 ANMF 中的偏移把一帧合成到画布上：超出画布边界的像素被裁掉；
