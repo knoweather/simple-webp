@@ -45,6 +45,12 @@ func (w *Webp) WriteTo(out io.Writer) (int64, error) {
 	if w.origChunks == nil {
 		return 0, errors.New("webp is not parsed")
 	}
+	if len(w.origChunks) == 0 {
+		// 空容器（NewWebp 之后还没放图像数据）写出来是非法文件，直接报错。
+		// An empty container (NewWebp without image data yet) would serialize to
+		// an invalid file, so it is an error.
+		return 0, errors.New("webp: no chunks to write")
+	}
 	names := make([]FourCC, 0, len(w.origChunks))
 	payloads := make([][]byte, 0, len(w.origChunks))
 	var anmfIdx int

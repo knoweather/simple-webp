@@ -1,7 +1,6 @@
 package simple_webp
 
 import (
-	"bytes"
 	"image"
 	"image/draw"
 	"io"
@@ -34,6 +33,21 @@ type EncodeOptions struct {
 	// out-of-range Method is not silently fallen back to the default but
 	// returns an error.
 	Method int
+	// ICCP 是内嵌的 ICC 色彩配置原始字节；非空时写出带标志位的 VP8X 与 ICCP。
+	//
+	// ICCP is the embedded ICC profile; when it is non-empty a flagged VP8X and
+	// an ICCP chunk are written.
+	ICCP []byte
+	// EXIF 是内嵌的 EXIF 元数据原始字节；非空时写出带标志位的 VP8X 与 EXIF。
+	//
+	// EXIF is the embedded EXIF metadata; when it is non-empty a flagged VP8X
+	// and an EXIF chunk are written.
+	EXIF []byte
+	// XMP 是内嵌的 XMP 元数据原始字节；非空时写出带标志位的 VP8X 与 XMP。
+	//
+	// XMP is the embedded XMP metadata; when it is non-empty a flagged VP8X and
+	// an XMP chunk are written.
+	XMP []byte
 }
 
 // Encode 把 m 编码为无损 WebP 文件并写入 w。
@@ -49,8 +63,11 @@ func Encode(w io.Writer, m image.Image, opt *EncodeOptions) error {
 }
 
 // EncodeBytes 把 m 编码为完整的无损 WebP 文件并保留在内存中返回。
+// 非空的 ICCP/EXIF/XMP 直接随文件写出；三者都为空时输出仍是不带 VP8X 的简单容器。
 //
-// EncodeBytes encodes m as a lossless WebP file held in memory.
+// EncodeBytes encodes m as a lossless WebP file held in memory. Non-empty
+// ICCP/EXIF/XMP are written straight into the file; when all three are empty
+// the output is still the simple container without a VP8X chunk.
 func EncodeBytes(m image.Image, opt *EncodeOptions) ([]byte, error) {
 	if m == nil {
 		return nil, errors.New("webp: nil image")
@@ -60,11 +77,13 @@ func EncodeBytes(m image.Image, opt *EncodeOptions) ([]byte, error) {
 		return nil, errors.New("webp: empty image")
 	}
 	method := 2
+	var iccp, exif, xmp []byte
 	if opt != nil {
 		if opt.Method < 0 || opt.Method > 2 {
 			return nil, errors.Errorf("webp: unsupported Method %d (supported: 0, 1, 2)", opt.Method)
 		}
 		method = opt.Method
+		iccp, exif, xmp = opt.ICCP, opt.EXIF, opt.XMP
 	}
 
 	pix := imageToARGB(m)
@@ -73,16 +92,11 @@ func EncodeBytes(m image.Image, opt *EncodeOptions) ([]byte, error) {
 		return nil, errors.Wrap(err, "webp: vp8l encode")
 	}
 
-	var buf bytes.Buffer
-	buf.Write(riffTag)
-	var size [4]byte
-	by.PutUint32(size[:], uint32(4+chunkSize(len(payload))))
-	buf.Write(size[:])
-	buf.Write(webpTag)
-	if err = writeRiffChunk(&buf, VP8LChunk, payload); err != nil {
+	chunks, err := encodeChunks(VP8LChunk, payload, b.Dx(), b.Dy(), iccp, exif, xmp)
+	if err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	return marshalWebpFile(chunks)
 }
 
 // imageToARGB 把任意 image.Image 转成 0xAARRGGBB 像素切片，借助 image/draw

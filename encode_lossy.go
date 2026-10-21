@@ -1,7 +1,6 @@
 package simple_webp
 
 import (
-	"bytes"
 	"image"
 
 	"image/draw"
@@ -30,6 +29,21 @@ type LossyOptions struct {
 	// the default 75. When it is false the old meaning stays: Quality == 0
 	// selects the default quality.
 	QualityZero bool
+	// ICCP 是内嵌的 ICC 色彩配置原始字节；非空时写出带标志位的 VP8X 与 ICCP。
+	//
+	// ICCP is the embedded ICC profile; when it is non-empty a flagged VP8X and
+	// an ICCP chunk are written.
+	ICCP []byte
+	// EXIF 是内嵌的 EXIF 元数据原始字节；非空时写出带标志位的 VP8X 与 EXIF。
+	//
+	// EXIF is the embedded EXIF metadata; when it is non-empty a flagged VP8X
+	// and an EXIF chunk are written.
+	EXIF []byte
+	// XMP 是内嵌的 XMP 元数据原始字节；非空时写出带标志位的 VP8X 与 XMP。
+	//
+	// XMP is the embedded XMP metadata; when it is non-empty a flagged VP8X and
+	// an XMP chunk are written.
+	XMP []byte
 }
 
 // defaultLossyQuality 是未指定质量时使用的取值。
@@ -50,8 +64,11 @@ func EncodeLossy(w io.Writer, m image.Image, opt *LossyOptions) error {
 }
 
 // EncodeLossyBytes 把 m 编码为完整的有损 WebP 文件并保留在内存中返回。
+// 非空的 ICCP/EXIF/XMP 直接随文件写出；三者都为空时输出仍是不带 VP8X 的简单容器。
 //
-// EncodeLossyBytes encodes m as a lossy WebP file held in memory.
+// EncodeLossyBytes encodes m as a lossy WebP file held in memory. Non-empty
+// ICCP/EXIF/XMP are written straight into the file; when all three are empty
+// the output is still the simple container without a VP8X chunk.
 //
 // 有损格式只承载亮度与色度，alpha 通道不参与编码：需要保留透明度时应改用
 // EncodeBytes 写出无损图像。
@@ -69,12 +86,14 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 		return nil, errors.New("webp: empty image")
 	}
 	quality := defaultLossyQuality
+	var iccp, exif, xmp []byte
 	if opt != nil {
 		if opt.QualityZero {
 			quality = opt.Quality
 		} else if opt.Quality != 0 {
 			quality = opt.Quality
 		}
+		iccp, exif, xmp = opt.ICCP, opt.EXIF, opt.XMP
 	}
 	if quality < 0 || quality > 100 {
 		return nil, errors.Errorf("webp: quality %d out of range 0..100", quality)
@@ -86,16 +105,11 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 		return nil, errors.Wrap(err, "webp: vp8 encode")
 	}
 
-	var buf bytes.Buffer
-	buf.Write(riffTag)
-	var size [4]byte
-	by.PutUint32(size[:], uint32(4+chunkSize(len(payload))))
-	buf.Write(size[:])
-	buf.Write(webpTag)
-	if err = writeRiffChunk(&buf, VP8Chunk, payload); err != nil {
+	chunks, err := encodeChunks(VP8Chunk, payload, b.Dx(), b.Dy(), iccp, exif, xmp)
+	if err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	return marshalWebpFile(chunks)
 }
 
 // imageToYCbCr420 把任意 image.Image 转成 4:2:0 的 YCbCr：亮度逐像素取，色度
