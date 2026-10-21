@@ -48,11 +48,11 @@ func TestColorTransformRoundTrip(t *testing.T) {
 		}
 	}
 
-	plain, err := encodeStream(pix, w, h, 2, true, false)
+	plain, err := encodeStream(pix, w, h, 2, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	withColor, err := encodeStream(pix, w, h, 2, true, true)
+	withColor, err := encodeStream(pix, w, h, 2, true, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestColorTransformNeverGrows(t *testing.T) {
 		state = state*1664525 + 1013904223
 		pix[i] = 0xff000000 | state&0x00ffffff
 	}
-	plain, err := encodeStream(pix, w, h, 2, true, false)
+	plain, err := encodeStream(pix, w, h, 2, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,6 +22,13 @@ type Options struct {
 	// cache_bits automatically from the colour repetition of the image, and the
 	// cache is only switched on when enough colours repeat.
 	DisableColorCache bool
+	// DisableMetaHuffman 关闭 meta 前缀码（按块切换 Huffman 码组）。默认在
+	// Method >= 1 且未启用颜色缓存时尝试，两种写法取更短的一个。
+	//
+	// DisableMetaHuffman turns the meta prefix codes (per block Huffman groups)
+	// off. By default Method >= 1 tries them when the colour cache is not in use,
+	// and the shorter of the two streams wins.
+	DisableMetaHuffman bool
 }
 
 // 编码器调参：单个后向引用与搜索窗口的像素上限、哈希表位数、哈希链探测
@@ -62,21 +69,23 @@ func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 	}
 	method := 1
 	colorCache := false
+	metaHuffman := false
 	if opt != nil {
 		method = opt.Method
 		colorCache = !opt.DisableColorCache
+		metaHuffman = !opt.DisableMetaHuffman
 	}
 	if method < 2 {
-		return encodeStream(pix, width, height, method, colorCache, false)
+		return encodeStream(pix, width, height, method, colorCache, false, false)
 	}
 	// 颜色变换未必总是划算：两种写法各编码一次，留下更短的那个。
 	// The colour transform does not always pay off: encode both variants and keep
 	// the shorter stream.
-	plain, err := encodeStream(pix, width, height, method, colorCache, false)
+	plain, err := encodeStream(pix, width, height, method, colorCache, false, metaHuffman)
 	if err != nil {
 		return nil, err
 	}
-	withColor, err := encodeStream(pix, width, height, method, colorCache, true)
+	withColor, err := encodeStream(pix, width, height, method, colorCache, true, metaHuffman)
 	if err != nil {
 		return nil, err
 	}
@@ -92,9 +101,10 @@ func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 // encodeStream encodes one complete bitstream (the 5-byte header included) for
 // the given strategy. With useColorTransform it applies the colour transform
 // before subtract green and the predictor.
-func encodeStream(pix []uint32, width, height, method int, colorCache, useColorTransform bool) ([]byte, error) {
+func encodeStream(pix []uint32, width, height, method int, colorCache, useColorTransform, metaHuffman bool) ([]byte, error) {
 	e := &encoder{}
 	e.useColorCache = method >= 1 && colorCache
+	e.useMetaHuffman = method >= 1 && metaHuffman
 	e.w.writeBits(0x2f, 8)
 	e.w.writeBits(uint32(width-1), 14)
 	e.w.writeBits(uint32(height-1), 14)
@@ -595,6 +605,11 @@ func (e *encoder) writeEntropyImage(pix []uint32, width, height int, level0 bool
 	if level0 && e.useColorCache {
 		cacheBits = chooseCacheBits(pix, tokens)
 	}
+	if level0 && e.useMetaHuffman && cacheBits == 0 {
+		if e.writeBestMeta(pix, tokens, width, height) {
+			return
+		}
+	}
 	if cacheBits == 0 {
 		e.writeEntropySection(pix, tokens, 0, level0)
 		return
@@ -683,6 +698,296 @@ func (e *encoder) writeEntropySection(pix []uint32, tokens []token, cacheBits in
 			e.w.writeBits(dextra, dn)
 		}
 	}
+}
+
+// metaBlockBits 是 meta 前缀码的块边长指数：每块 16×16 像素。
+//
+// metaBlockBits is the block size exponent of the meta prefix codes: 16 by 16
+// pixels per block.
+const metaBlockBits = 4
+
+// blockEvent 是归属于某一个块的事件，供按码组写出时使用。
+//
+// blockEvent is an event that belongs to one block, used when writing per group.
+type blockEvent struct {
+	ev    vp8lEvent
+	block int
+}
+
+// metaPlan 是一次 meta 前缀码编码方案：块到码组的映射、按像素顺序排列的事件
+// 以及两组 Huffman 树。
+//
+// metaPlan is one meta prefix code scheme: the block to group mapping, the events
+// in pixel order and the two sets of Huffman trees.
+type metaPlan struct {
+	prefixBits   int
+	blockWidth   int
+	blockHeight  int
+	groupOfBlock []int
+	events       []blockEvent
+	trees        [2][5]huffmanCode
+}
+
+// splitBlockEvents 把 token 序列切成不跨块的块内事件：字面量本来就是一像素，
+// 后向引用在块边界处拆成多段（距离不变，逐像素复制语义不受影响）。
+//
+// splitBlockEvents cuts the token sequence into block local events: a literal is
+// one pixel already, a backward reference is split at block boundaries (the
+// distance stays the same and the pixel by pixel copy semantics are unchanged).
+func splitBlockEvents(tokens []token, width, height, bits, blockWidth int) []blockEvent {
+	out := make([]blockEvent, 0, len(tokens))
+	pos := 0
+	for _, t := range tokens {
+		if t.length == 0 {
+			y, x := pos/width, pos%width
+			out = append(out, blockEvent{
+				ev:    vp8lEvent{kind: evLiteral, pixel: t.literal},
+				block: (y>>bits)*blockWidth + (x >> bits),
+			})
+			pos++
+			continue
+		}
+		remaining := t.length
+		for remaining > 0 {
+			y, x := pos/width, pos%width
+			blockRight := (((x >> bits) + 1) << bits) - 1
+			if blockRight >= width {
+				blockRight = width - 1
+			}
+			run := blockRight - x + 1
+			if run > remaining {
+				run = remaining
+			}
+			out = append(out, blockEvent{
+				ev:    vp8lEvent{kind: evCopy, length: run, dist: t.dist},
+				block: (y>>bits)*blockWidth + (x >> bits),
+			})
+			pos += run
+			remaining -= run
+		}
+	}
+	return out
+}
+
+// planMeta 规划一次 meta 前缀码编码：按块的活动度（横向相邻像素差之和）把块
+// 分成两组，再为每组统计符号并建树。块数太少、只用到一个组或某些符号无法编码
+// 时放弃。
+//
+// planMeta plans one meta prefix code encode: the blocks are split into two groups
+// by their activity (the sum of horizontal neighbour differences), and every group
+// gets its own symbol statistics and trees. It gives up when there are too few
+// blocks, only one group is used or a symbol table cannot be built.
+func planMeta(pix []uint32, tokens []token, width, height int) (metaPlan, bool) {
+	bits := metaBlockBits
+	blockWidth := divRoundUp(width, 1<<bits)
+	blockHeight := divRoundUp(height, 1<<bits)
+	blocks := blockWidth * blockHeight
+	if blocks < 4 {
+		return metaPlan{}, false
+	}
+	events := splitBlockEvents(tokens, width, height, bits, blockWidth)
+	if len(events) < blocks {
+		return metaPlan{}, false
+	}
+
+	// 每块先统计绿色符号分布，再按 L1 距离做两簇的 k-means：符号分布相近的
+	// 块共用一组 Huffman 树，这才是 meta 前缀码要利用的结构。
+	// Every block gets a green symbol histogram, then two k-means clusters are
+	// formed on the L1 distance: blocks that use similar symbols share one set of
+	// Huffman trees, which is the structure the meta prefix codes exploit.
+	const alphabet = 256 + 24
+	hist := make([][]float64, blocks)
+	for i := range hist {
+		hist[i] = make([]float64, alphabet)
+	}
+	blockEvents := make([]int, blocks)
+	for _, be := range events {
+		blockEvents[be.block]++
+		switch be.ev.kind {
+		case evLiteral:
+			hist[be.block][be.ev.pixel>>8&0xff]++
+		case evCopy:
+			prefix, _, _ := encodePrefix(be.ev.length)
+			hist[be.block][256+prefix]++
+		}
+	}
+	for b := range hist {
+		if blockEvents[b] == 0 {
+			return metaPlan{}, false
+		}
+		for i := range hist[b] {
+			hist[b][i] /= float64(blockEvents[b])
+		}
+	}
+	dist := func(a, b []float64) float64 {
+		var d float64
+		for i := range a {
+			if a[i] > b[i] {
+				d += a[i] - b[i]
+			} else {
+				d += b[i] - a[i]
+			}
+		}
+		return d
+	}
+	// 以「离第一块最远」的块作为第二簇的起点。
+	// The block farthest from the first one seeds the second cluster.
+	seedA, seedB := 0, 0
+	bestDist := -1.0
+	for i := 1; i < blocks; i++ {
+		if d := dist(hist[0], hist[i]); d > bestDist {
+			bestDist = d
+			seedB = i
+		}
+	}
+	centerA := append([]float64(nil), hist[seedA]...)
+	centerB := append([]float64(nil), hist[seedB]...)
+	if bestDist <= 0 {
+		return metaPlan{}, false
+	}
+	group := make([]int, blocks)
+	for iter := 0; iter < 4; iter++ {
+		counts := [2]int{}
+		means := [2][]float64{make([]float64, alphabet), make([]float64, alphabet)}
+		for b := range hist {
+			if dist(hist[b], centerA) <= dist(hist[b], centerB) {
+				group[b] = 0
+			} else {
+				group[b] = 1
+			}
+			counts[group[b]]++
+			for i, v := range hist[b] {
+				means[group[b]][i] += v
+			}
+		}
+		if counts[0] == 0 || counts[1] == 0 {
+			return metaPlan{}, false
+		}
+		for g := 0; g < 2; g++ {
+			for i := range means[g] {
+				means[g][i] /= float64(counts[g])
+			}
+		}
+		centerA, centerB = means[0], means[1]
+	}
+
+	plan := metaPlan{
+		prefixBits:   bits,
+		blockWidth:   blockWidth,
+		blockHeight:  blockHeight,
+		groupOfBlock: group,
+		events:       events,
+	}
+	groupCount := [2]int{}
+	for _, be := range events {
+		groupCount[plan.groupOfBlock[be.block]]++
+	}
+	if groupCount[0] == 0 || groupCount[1] == 0 {
+		return metaPlan{}, false
+	}
+
+	var freq [2][5][]uint32
+	for g := 0; g < 2; g++ {
+		freq[g][0] = make([]uint32, 256+24)
+		freq[g][1] = make([]uint32, 256)
+		freq[g][2] = make([]uint32, 256)
+		freq[g][3] = make([]uint32, 256)
+		freq[g][4] = make([]uint32, 40)
+	}
+	for _, be := range events {
+		g := plan.groupOfBlock[be.block]
+		ev := be.ev
+		switch ev.kind {
+		case evLiteral:
+			freq[g][0][ev.pixel>>8&0xff]++
+			freq[g][1][ev.pixel>>16&0xff]++
+			freq[g][2][ev.pixel&0xff]++
+			freq[g][3][ev.pixel>>24&0xff]++
+		case evCopy:
+			prefix, _, _ := encodePrefix(ev.length)
+			freq[g][0][256+prefix]++
+			dprefix, _, _ := encodePrefix(ev.dist + 120)
+			freq[g][4][dprefix]++
+		}
+	}
+	for g := 0; g < 2; g++ {
+		for i := 0; i < 5; i++ {
+			plan.trees[g][i] = newHuffmanCode(freq[g][i], 15)
+		}
+	}
+	return plan, true
+}
+
+// writeMetaSection 写出一段带 meta 前缀码的熵编码图像：不使用颜色缓存、写 meta
+// 标志与块边长、把码组索引写成一张子图、再按组写五组前缀码与逐块的事件流。
+//
+// writeMetaSection writes one entropy coded image with meta prefix codes: no
+// colour cache, the meta flag and block size, the group indices as a sub-image,
+// then the five prefix codes per group and the per block event stream.
+func (e *encoder) writeMetaSection(plan metaPlan) {
+	e.w.writeBits(0, 1) // 不使用颜色缓存 / no colour cache
+	e.w.writeBits(1, 1) // 使用元前缀图像 / meta prefix codes present
+	e.w.writeBits(uint32(plan.prefixBits-2), 3)
+	metaPix := make([]uint32, len(plan.groupOfBlock))
+	for i, g := range plan.groupOfBlock {
+		metaPix[i] = uint32(g) << 8
+	}
+	e.writeEntropyImage(metaPix, plan.blockWidth, plan.blockHeight, false)
+	for g := 0; g < 2; g++ {
+		for i := 0; i < 5; i++ {
+			e.writeHuffmanCode(plan.trees[g][i])
+		}
+	}
+	// 事件必须按像素顺序写出，码组只是决定用哪棵树；块在画布上并不连续。
+	// The events go in pixel order; the group only selects the tree. A block is
+	// not contiguous in the pixel stream.
+	for _, be := range plan.events {
+		e.writeEvent(&plan.trees[plan.groupOfBlock[be.block]], be.ev)
+	}
+}
+
+// writeEvent 用给定的五棵树写出一个事件。
+//
+// writeEvent writes one event with the given five trees.
+func (e *encoder) writeEvent(trees *[5]huffmanCode, ev vp8lEvent) {
+	switch ev.kind {
+	case evLiteral:
+		e.writeSymbol(trees[0], ev.pixel>>8&0xff)
+		e.writeSymbol(trees[1], ev.pixel>>16&0xff)
+		e.writeSymbol(trees[2], ev.pixel&0xff)
+		e.writeSymbol(trees[3], ev.pixel>>24&0xff)
+	case evCacheRef:
+		e.writeSymbol(trees[0], uint32(256+24+ev.index))
+	case evCopy:
+		prefix, extra, n := encodePrefix(ev.length)
+		e.writeSymbol(trees[0], 256+prefix)
+		e.w.writeBits(extra, n)
+		dprefix, dextra, dn := encodePrefix(ev.dist + 120)
+		e.writeSymbol(trees[4], dprefix)
+		e.w.writeBits(dextra, dn)
+	}
+}
+
+// writeBestMeta 试写 meta 前缀码版本与普通版本，留下更短的那个；返回 true
+// 表示已经写出了一段完整内容。
+//
+// writeBestMeta tries the meta prefix code version and the plain one and keeps
+// the shorter; a true return means a complete section has been written.
+func (e *encoder) writeBestMeta(pix []uint32, tokens []token, width, height int) bool {
+	plan, ok := planMeta(pix, tokens, width, height)
+	if !ok {
+		return false
+	}
+	mark := e.w.mark()
+	e.writeMetaSection(plan)
+	withMeta := e.w.mark()
+	e.w.restore(mark)
+	e.writeEntropySection(pix, tokens, 0, true)
+	if withMeta.pos() < e.w.bitPos() {
+		e.w.restore(mark)
+		e.writeMetaSection(plan)
+	}
+	return true
 }
 
 // token 是 LZ77 的一步：length 为零时 literal 保存一个字面像素，否则
@@ -1145,6 +1450,10 @@ type encoder struct {
 	// useColorCache decides whether the outermost image uses the colour cache
 	// when the colours repeat enough.
 	useColorCache bool
+	// useMetaHuffman 决定最外层图像是否尝试按块切换 Huffman 码组。
+	// useMetaHuffman decides whether the outermost image tries per block Huffman
+	// groups.
+	useMetaHuffman bool
 }
 
 // bitWriter 按 VP8L 的要求以最低有效位优先写比特。
