@@ -128,9 +128,22 @@ func ParseWebp(r io.Reader, verifySize ...bool) (*Webp, error) {
 	}
 	declared := by.Uint32(head[4:8])
 
+	// declared is the RIFF File Size: the 4 byte 'WEBP' tag plus every chunk
+	// that follows it, so the chunk region is declared-4 bytes long. Data after
+	// that point is not part of the container and is ignored. A declared size
+	// below 4 is clearly invalid, so the stream is read to EOF as before.
+	//
+	// declared 是 RIFF File Size：'WEBP' 4 字节加其后全部 chunk，所以 chunk 区长度为
+	// declared-4。该点之后的数据不属于容器，一律忽略；declared 小于 4 明显非法，
+	// 保持原来的读到 EOF 行为。
+	var src io.Reader = cr
+	if declared >= 4 {
+		src = io.LimitReader(cr, int64(declared)-4)
+	}
+
 	var w = &Webp{}
 	for {
-		c, err := readRiffChunk(cr)
+		c, err := readRiffChunk(src)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -143,6 +156,12 @@ func ParseWebp(r io.Reader, verifySize ...bool) (*Webp, error) {
 		return nil, errors.New("invalid webp: no chunks")
 	}
 	if len(verifySize) > 0 && verifySize[0] {
+		// The limited read only counted up to the declared size, so drain the
+		// trailing bytes before comparing the counters.
+		// 限定读取只统计到声明长度，所以先把尾部数据读掉再比对计数。
+		if _, err := io.Copy(io.Discard, cr); err != nil {
+			return nil, errors.WithMessage(err, "invalid webp: can not read trailing data")
+		}
 		if got := uint32(cr.n - 8); got != declared {
 			return nil, errors.Errorf("invalid webp: RIFF size is %d, stream is %d", declared, got)
 		}
@@ -383,15 +402,47 @@ func (w *Webp) RawChunkByName(name FourCC) ([]byte, bool) {
 	return nil, false
 }
 
+// clearFlag 在存在 VP8X 时清除一个特性标志位，保持标志与数据一致。
+func (w *Webp) clearFlag(flag uint8) {
+	if w.VP8X != nil {
+		w.VP8X.Flags &^= flag
+	}
+}
+
+// hasExtendedFeatures 报告流里是否还有必须依赖 VP8X 的扩展特性：已解析的
+// 结构体，或者仍以原始形态留在流中的扩展 chunk。
+func (w *Webp) hasExtendedFeatures() bool {
+	if w.ICCP != nil || w.EXIF != nil || w.XMP != nil || w.ALPH != nil || w.ANIM != nil || len(w.ANMFs) > 0 {
+		return true
+	}
+	for _, c := range w.chunks {
+		switch c.name {
+		case ICCPChunk, EXIFChunk, XMPChunk, ALPHChunk, ANIMChunk, ANMFChunk:
+			return true
+		}
+	}
+	return false
+}
+
 // DeleteRawChunk 从流中删除所有指定类型的 chunk 并返回删除数量。
-// 既适用于原生解码的元数据 chunk（ICCP、EXIF、XMP），也适用于未知的
-// 原始 chunk；删除后调用 WriteTo 写出的流不再包含这些 chunk。
+// 既适用于原生解码的元数据 chunk（ICCP、EXIF、XMP），也适用于解析时已被
+// 消费的 ALPH、ANIM、ANMF、VP8X、VP8、VP8L，以及未知的原始 chunk；删除后
+// 调用 WriteTo 写出的流不再包含这些 chunk，VP8X 的对应标志位同步清除，
+// 保持标志与数据一致。三条例外都会产出非法流，因此不删除任何东西，返回 0：
+// 还有 ANMF 帧时删 ANIM、还有扩展特性时删 VP8X、以及删掉唯一的图像数据。
 // DeleteRawChunk removes every chunk of the given type from the stream and
-// returns how many chunks were removed. It works for the metadata chunks that
-// are decoded natively (ICCP, EXIF, XMP) as well as for unknown raw chunks; a
-// WriteTo afterwards writes the stream without those chunks.
+// returns how many chunks were removed. It covers the metadata chunks decoded
+// natively (ICCP, EXIF, XMP), the chunks already consumed by parsing (ALPH,
+// ANIM, ANMF, VP8X, VP8, VP8L), and unknown raw chunks; a WriteTo afterwards
+// writes the stream without those chunks, and the matching VP8X flag bit is
+// cleared so the flags stay consistent with the data. Three cases are refused
+// because they would produce an invalid stream: deleting ANIM while ANMF frames
+// still exist, deleting VP8X while an extended feature still needs it, and
+// deleting the only image data chunk. In all three cases nothing is removed and
+// the result is 0.
 func (w *Webp) DeleteRawChunk(name FourCC) int {
 	removed := 0
+	gone := make(map[FourCC]bool)
 	// 原生解码的元数据 chunk 通过清空解析结构体来删除；若 VP8X 存在，同步
 	// 清除其对应该 chunk 的标志位，保持标志位与数据一致。
 	// native metadata chunks are dropped by clearing the parsed struct; when a
@@ -402,25 +453,85 @@ func (w *Webp) DeleteRawChunk(name FourCC) int {
 		if w.ICCP != nil {
 			w.ICCP = nil
 			removed++
-			if w.VP8X != nil {
-				w.VP8X.Flags &^= FlagICC
-			}
+			w.clearFlag(FlagICC)
+			gone[ICCPChunk] = true
 		}
 	case EXIFChunk:
 		if w.EXIF != nil {
 			w.EXIF = nil
 			removed++
-			if w.VP8X != nil {
-				w.VP8X.Flags &^= FlagEXIF
-			}
+			w.clearFlag(FlagEXIF)
+			gone[EXIFChunk] = true
 		}
 	case XMPChunk:
 		if w.XMP != nil {
 			w.XMP = nil
 			removed++
-			if w.VP8X != nil {
-				w.VP8X.Flags &^= FlagXMP
+			w.clearFlag(FlagXMP)
+			gone[XMPChunk] = true
+		}
+	case ALPHChunk:
+		if w.ALPH != nil {
+			w.ALPH = nil
+			removed++
+			w.clearFlag(FlagAlpha)
+			// alpha 只剩无损码流头里的 alpha_is_used 位
+			// alpha now comes only from the lossless header's alpha_is_used bit
+			w.HasAlpha = w.VP8L != nil && w.VP8L.AlphaUsed
+			gone[ALPHChunk] = true
+		}
+	case ANIMChunk:
+		// 还有帧时删 ANIM 会产出「有帧无 ANIM」的非法流，拒绝删除（返回 0）。
+		// deleting ANIM while frames remain would leave frames without ANIM,
+		// which is invalid, so the deletion is refused (returns 0).
+		if w.ANIM != nil && len(w.ANMFs) == 0 {
+			w.ANIM = nil
+			removed++
+			w.clearFlag(FlagAnimation)
+			w.HasAnimation = false
+			gone[ANIMChunk] = true
+		}
+	case ANMFChunk:
+		if n := len(w.ANMFs); n > 0 {
+			w.ANMFs = nil
+			removed += n
+			w.clearFlag(FlagAnimation)
+			w.HasAnimation = false
+			// 没有帧的 ANIM 是非法的，一并删掉
+			// an ANIM without frames is invalid, so it goes too
+			if w.ANIM != nil {
+				w.ANIM = nil
+				removed++
+				gone[ANIMChunk] = true
 			}
+			gone[ANMFChunk] = true
+		}
+	case VP8XChunk:
+		// 还有扩展特性时删 VP8X 会让 ICCP/EXIF/XMP/ALPH/ANIM 悬空，拒绝删除。
+		// refusing to drop VP8X while an extended feature still needs it.
+		if w.VP8X != nil && !w.hasExtendedFeatures() {
+			w.VP8X = nil
+			removed++
+			w.HasAlpha = w.VP8L != nil && w.VP8L.AlphaUsed
+			gone[VP8XChunk] = true
+		}
+	case VP8Chunk:
+		// 删掉唯一的图像数据会产出没有像素的容器，拒绝删除。
+		// removing the only image data would leave a container without pixels.
+		if w.VP8 != nil && (w.VP8L != nil || len(w.ANMFs) > 0) {
+			w.VP8 = nil
+			removed++
+			gone[VP8Chunk] = true
+		}
+	case VP8LChunk:
+		if w.VP8L != nil && (w.VP8 != nil || len(w.ANMFs) > 0) {
+			w.VP8L = nil
+			removed++
+			w.HasAlpha = w.ALPH != nil
+			if !w.HasAlpha {
+				w.clearFlag(FlagAlpha)
+			}
+			gone[VP8LChunk] = true
 		}
 	}
 
@@ -440,36 +551,74 @@ func (w *Webp) DeleteRawChunk(name FourCC) int {
 	// 同步更新原始顺序快照，让 WriteTo 跳过这些 chunk
 	// keep the original order snapshot in sync so WriteTo skips the chunks
 	for i, c := range w.origChunks {
-		if c.name != name || w.origDeleted[i] {
+		if w.origDeleted[i] {
 			continue
 		}
-		// 已消费的 chunk 仅在其结构体被清空时才跳过，
-		// 未消费的 chunk 仅当它已从原始列表移除时才跳过
-		// a consumed chunk is skipped only when its struct is gone, an
-		// unconsumed one only when it was removed from the raw list
 		if w.origConsumed[i] {
-			switch name {
-			case ICCPChunk, EXIFChunk, XMPChunk:
+			// 已消费的 chunk 只在对应结构体被清空时才算删除
+			// a consumed chunk counts as deleted only when its struct was cleared
+			if gone[c.name] {
 				w.origDeleted[i] = true
 			}
 			continue
 		}
-		if rawRemoved > 0 {
+		// 未消费的原始 chunk 只在它已从原始列表移除时才算删除
+		// an unconsumed raw chunk counts as deleted only when it left the raw list
+		if c.name == name && rawRemoved > 0 {
 			w.origDeleted[i] = true
 		}
 	}
 	return removed
 }
 
-// AddRawChunk 把一个新的原始 chunk 插入流中，位置在第一个图像 chunk
-// （VP8、VP8L 或 ANMF）之前；没有图像 chunk 时追加到末尾。可用于给已解析
-// 的文件补充 EXIF 或 XMP 等 chunk。name 必须是合法 FourCC，data 不得超过
+// chunkInsertRank 返回一种 chunk 在容器顺序中的排位，新 chunk 依排位插入。
+func chunkInsertRank(name FourCC) int {
+	switch name {
+	case VP8XChunk:
+		return 0
+	case ICCPChunk:
+		return 1
+	case ANIMChunk:
+		return 2
+	case ANMFChunk:
+		return 3
+	case ALPHChunk:
+		return 4
+	case VP8Chunk, VP8LChunk:
+		return 5
+	default:
+		return 6
+	}
+}
+
+// chunkInsertIndex 返回把排位为 r 的新 chunk 插入 names 时的下标：跳过所有
+// 排位不大于 r 的 chunk；排位 6 的 chunk 追加到尾部。
+func chunkInsertIndex(names []FourCC, r int) int {
+	if r >= 6 {
+		return len(names)
+	}
+	for i, n := range names {
+		if chunkInsertRank(n) > r {
+			return i
+		}
+	}
+	return len(names)
+}
+
+// AddRawChunk 把一个新的原始 chunk 按类型排位插入流中：跳过所有排位不大于
+// 自身的已有 chunk，即 VP8X 最前，ICCP 在 VP8X 之后、ANIM/ANMF/图像数据之前，
+// ANIM 在第一个 ANMF 之前，ALPH 在 ANIM/ANMF 之后、VP8/VP8L 之前，VP8/VP8L
+// 之后是 EXIF、XMP 等尾部 chunk；排位 6 一律追加到末尾。可用于给已解析的文件
+// 补充 EXIF 或 XMP 等 chunk。name 必须是合法 FourCC，data 不得超过
 // maxChunkSize，且 Webp 必须来自成功的 ParseWebp。
-// AddRawChunk inserts a new raw chunk into the stream before the first image
-// chunk (VP8, VP8L or ANMF); if there is no image chunk it is appended. Use it
-// e.g. to add an EXIF or XMP chunk to an already parsed file. name must be a
-// valid FourCC, data must fit in maxChunkSize and the Webp must come from a
-// successful ParseWebp.
+//
+// AddRawChunk inserts a new raw chunk at the position its type dictates: it
+// skips every existing chunk whose rank is not greater than its own, so VP8X
+// comes first, ICCP follows VP8X and precedes ANIM, ANMF and the image data,
+// ANIM precedes the first ANMF, ALPH follows ANIM/ANMF and precedes VP8/VP8L,
+// and EXIF, XMP or unknown types land at the end. Use it e.g. to add an EXIF or
+// XMP chunk to an already parsed file. name must be a valid FourCC, data must
+// fit in maxChunkSize and the Webp must come from a successful ParseWebp.
 func (w *Webp) AddRawChunk(name FourCC, data []byte) error {
 	if !validFourCC(name) {
 		return errors.Errorf("invalid chunk type %q", string(name))
@@ -481,16 +630,11 @@ func (w *Webp) AddRawChunk(name FourCC, data []byte) error {
 		return errors.New("webp is not parsed")
 	}
 	c := &riffChunk{name: name, data: data}
-	insertAt := len(w.origChunks)
+	names := make([]FourCC, len(w.origChunks))
 	for i, oc := range w.origChunks {
-		switch oc.name {
-		case VP8Chunk, VP8LChunk, ANMFChunk:
-			insertAt = i
-		}
-		if insertAt != len(w.origChunks) {
-			break
-		}
+		names[i] = oc.name
 	}
+	insertAt := chunkInsertIndex(names, chunkInsertRank(name))
 	n := len(w.origChunks) + 1
 	chunks := make([]*riffChunk, 0, n)
 	consumed := make([]bool, 0, n)

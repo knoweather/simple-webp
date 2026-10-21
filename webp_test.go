@@ -258,11 +258,11 @@ func TestCustomChunk(t *testing.T) {
 }
 
 // TestAddDeleteRawChunk 验证原始 chunk 的增删：新增的 EXIF/XMP 往返后
-// 仍可读出，且写在图像数据之前；删除后不再出现在输出里。
+// 仍可读出，且按惯例写在图像数据之后；删除后不再出现在输出里。
 //
 // TestAddDeleteRawChunk checks adding and deleting raw chunks: added
-// EXIF/XMP survive a round trip and are written before the image data, and
-// a deleted chunk no longer appears in the output.
+// EXIF/XMP survive a round trip and are written after the image data, as
+// convention puts them; a deleted chunk no longer appears in the output.
 func TestAddDeleteRawChunk(t *testing.T) {
 	stream := buildWebp(chunkBytes("VP8 ", vp8Payload(8, 8)))
 	w, err := ParseWebpBytes(stream)
@@ -289,9 +289,13 @@ func TestAddDeleteRawChunk(t *testing.T) {
 	if w2.XMP == nil || string(w2.XMP.Data) != "new xmp" {
 		t.Fatalf("xmp after add: %+v", w2.XMP)
 	}
-	// 新增的 chunk 必须写在图像数据之前 / the added chunks must precede the image data
-	if bytes.Index(out, []byte("new exif")) > bytes.Index(out, []byte("VP8 ")) {
-		t.Fatal("EXIF chunk must be written before the image data")
+	// 新增的元数据 chunk 写在图像数据之后，并按 EXIF、XMP 的先后排列
+	// added metadata chunks go after the image data, EXIF before XMP
+	vp8At := bytes.Index(out, []byte("VP8 "))
+	exifAt := bytes.Index(out, []byte("new exif"))
+	xmpAt := bytes.Index(out, []byte("new xmp"))
+	if vp8At < 0 || exifAt < vp8At || xmpAt < exifAt {
+		t.Fatalf("metadata order: vp8=%d exif=%d xmp=%d", vp8At, exifAt, xmpAt)
 	}
 
 	if n := w2.DeleteRawChunk("EXIF"); n != 1 {

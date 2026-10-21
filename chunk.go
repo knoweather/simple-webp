@@ -419,6 +419,11 @@ type ANMF struct {
 	// Exactly one of VP8 and VP8L is non-nil and carries the frame bitstream.
 	VP8  *VP8
 	VP8L *VP8L
+
+	// subs 按原始顺序保存本帧的全部子 chunk（已知与未知），供 data 原样重建。
+	// subs holds all of the frame's sub-chunks in the order they appeared in the
+	// file, known and unknown alike, so data can rebuild the frame unchanged.
+	subs []*riffChunk
 }
 
 // ChunkName 返回 ANMF 的 chunk 类型码。
@@ -447,8 +452,9 @@ func (a *ANMF) Parse(c *RawChunk) error {
 
 	r := bytes.NewReader(c.Data[16:])
 	for {
-		// 逐个读出嵌套的子 chunk 直到流结束；未知类型的子 chunk 直接跳过。
-		// Read the nested sub-chunks until the stream ends; unknown types are skipped.
+		// 逐个读出嵌套的子 chunk 直到流结束；未知类型的子 chunk 只记录不解析。
+		// Read the nested sub-chunks until the stream ends; unknown types are
+		// recorded but not decoded.
 		sub, err := readRiffChunk(r)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -456,18 +462,42 @@ func (a *ANMF) Parse(c *RawChunk) error {
 			}
 			return errors.WithStack(err)
 		}
+		// 记下读出的顺序与原始载荷，写回时按这个顺序原样输出未知类型。
+		// Record the order and the raw payload so writing emits the sub-chunks
+		// in the same order and unknown ones byte for byte.
+		a.subs = append(a.subs, sub)
 		switch sub.name {
 		case ALPHChunk:
+			// 同一帧内的子 chunk 只允许出现一次；VP8 与 VP8L 更是互斥，
+			// 重复或冲突的帧无法确定该用哪份码流，直接报错而不是覆盖。
+			// A sub-chunk may appear only once per frame and VP8 and VP8L are
+			// mutually exclusive; a duplicate or conflicting frame cannot be
+			// resolved to one bitstream, so it is rejected instead of overwritten.
+			if a.ALPH != nil {
+				return errors.Errorf("invalid anmf chunk: duplicate %q sub-chunk", string(sub.name))
+			}
 			a.ALPH = &ALPH{}
 			if err = a.ALPH.Parse(&RawChunk{Name: sub.name, Data: sub.data}); err != nil {
 				return err
 			}
 		case VP8Chunk:
+			if a.VP8 != nil {
+				return errors.Errorf("invalid anmf chunk: duplicate %q sub-chunk", string(sub.name))
+			}
+			if a.VP8L != nil {
+				return errors.Errorf("invalid anmf chunk: both %q and %q sub-chunks", string(sub.name), string(VP8LChunk))
+			}
 			a.VP8 = &VP8{}
 			if err = a.VP8.Parse(&RawChunk{Name: sub.name, Data: sub.data}); err != nil {
 				return err
 			}
 		case VP8LChunk:
+			if a.VP8L != nil {
+				return errors.Errorf("invalid anmf chunk: duplicate %q sub-chunk", string(sub.name))
+			}
+			if a.VP8 != nil {
+				return errors.Errorf("invalid anmf chunk: both %q and %q sub-chunks", string(sub.name), string(VP8Chunk))
+			}
 			a.VP8L = &VP8L{}
 			if err = a.VP8L.Parse(&RawChunk{Name: sub.name, Data: sub.data}); err != nil {
 				return err
@@ -480,10 +510,16 @@ func (a *ANMF) Parse(c *RawChunk) error {
 	return nil
 }
 
-// data 把这一帧重新序列化：16 字节头部后依次嵌套 ALPH（若有）、VP8L、VP8
-// 子 chunk，编码顺序与 Parse 的解码顺序一致。
-// data re-serializes the frame: the 16-byte header followed by the nested
-// ALPH (if present), VP8L and VP8 sub-chunks, in the order Parse reads them.
+// data 把这一帧重新序列化：16 字节头部后嵌套子 chunk。经过 Parse 的帧按 subs 记录
+// 的原始顺序逐个写出，未知类型与对应结构体为 nil 的子 chunk 用原始载荷原样写回；
+// 原始流里没有、但已被赋值的新结构体（例如解析后补上的 ALPH）追加在最后，顺序为
+// ALPH、VP8L、VP8——未经 Parse 的手工构造帧同样走这条固定顺序。
+// data re-serializes the frame: the 16-byte header followed by the sub-chunks.
+// A parsed frame is written in the order recorded in subs, with unknown types and
+// sub-chunks whose struct is nil emitted from their original payload; a struct
+// assigned after parsing (an ALPH added later, for instance) has no place in the
+// original stream, so it is appended in the fixed order ALPH, VP8L, VP8 — the
+// same order a manually built frame without subs is written in.
 func (a *ANMF) data() []byte {
 	out := make([]byte, 16, 16+64)
 	writeUint24(out[0:3], uint32(a.X/2))
@@ -499,13 +535,29 @@ func (a *ANMF) data() []byte {
 		flags |= 0x1
 	}
 	out[15] = flags
-	if a.ALPH != nil {
+	var sawALPH, sawVP8L, sawVP8 bool
+	for _, sub := range a.subs {
+		switch {
+		case sub.name == ALPHChunk && a.ALPH != nil:
+			out = append(out, marshalRiffChunk(ALPHChunk, append([]byte{a.ALPH.header()}, a.ALPH.Data...))...)
+			sawALPH = true
+		case sub.name == VP8Chunk && a.VP8 != nil:
+			out = append(out, marshalRiffChunk(VP8Chunk, a.VP8.Data)...)
+			sawVP8 = true
+		case sub.name == VP8LChunk && a.VP8L != nil:
+			out = append(out, marshalRiffChunk(VP8LChunk, a.VP8L.Data)...)
+			sawVP8L = true
+		default:
+			out = append(out, marshalRiffChunk(sub.name, sub.data)...)
+		}
+	}
+	if a.ALPH != nil && !sawALPH {
 		out = append(out, marshalRiffChunk(ALPHChunk, append([]byte{a.ALPH.header()}, a.ALPH.Data...))...)
 	}
-	if a.VP8L != nil {
+	if a.VP8L != nil && !sawVP8L {
 		out = append(out, marshalRiffChunk(VP8LChunk, a.VP8L.Data)...)
 	}
-	if a.VP8 != nil {
+	if a.VP8 != nil && !sawVP8 {
 		out = append(out, marshalRiffChunk(VP8Chunk, a.VP8.Data)...)
 	}
 	return out

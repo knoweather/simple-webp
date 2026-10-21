@@ -182,7 +182,7 @@ func (w *Webp) MarshalBytes() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// finalizeWrite 修正扩展特性 chunk 的序列化，解决两个真实使用痛点：
+// finalizeWrite 修正扩展特性 chunk 的序列化，解决三个真实使用痛点：
 //
 //  1. 直接给 w.ICCP / w.EXIF / w.XMP 赋值（原文件并不含对应 chunk）时，写回
 //     会丢失这些数据——WriteTo 只遍历解析时已有的 origChunks，新赋的结构体
@@ -190,13 +190,16 @@ func (w *Webp) MarshalBytes() ([]byte, error) {
 //  2. 纯 VP8L（或任何不含 VP8X）的文件在补加 metadata 时必须先有一个 VP8X
 //     chunk 并置上对应标志位（ICCP/EXIF/XMP 都只能藏在 VP8X 之后，且依赖其
 //     标志位被读取器索引）。本函数在缺 VP8X 时自动创建，并以当前状态置位。
+//  3. 补写的 chunk 按类型排位决定插入点（见 chunkInsertRank）：VP8X 最前，
+//     ICCP 紧随 VP8X 且排在 ANIM/ANMF/图像数据之前，EXIF 与 XMP 落在图像
+//     数据之后的尾部。
 //
 // 标志位处理是「只置位、不清除」：仅把确实存在的扩展特性对应的位打开，绝不
 // 关闭原本合法的标志位，从而不影响未做修改的流。删除 metadata 时由
 // DeleteRawChunk 负责清除对应标志位。
 //
 // finalizeWrite fixes the serialization of extended-feature chunks, addressing
-// two real pain points: (1) a directly assigned w.ICCP/w.EXIF/w.XMP that the
+// three real pain points: (1) a directly assigned w.ICCP/w.EXIF/w.XMP that the
 // original file did not contain was silently dropped by WriteTo, which only
 // walks the chunks parsed from the source; this function writes those structs
 // back. (2) a file without a VP8X chunk (e.g. a plain VP8L) must gain a VP8X
@@ -205,7 +208,10 @@ func (w *Webp) MarshalBytes() ([]byte, error) {
 // VP8X when missing and sets its flags from the current state. Flag handling is
 // "set, never clear": it only turns on bits for features that are truly present,
 // so it never disturbs a previously valid stream. DeleteRawChunk clears the bits
-// when metadata is removed.
+// when metadata is removed. (3) a synthesized chunk goes to the position its
+// type dictates (see chunkInsertRank): VP8X first, ICCP right after VP8X and
+// before ANIM/ANMF and the image data, EXIF and XMP after the image data at the
+// end.
 func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]byte) {
 	present := make(map[FourCC]bool, len(names))
 	for _, n := range names {
@@ -259,10 +265,10 @@ func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]b
 	if w.XMP != nil || present[XMPChunk] {
 		presentFlags |= FlagXMP
 	}
-	if w.ALPH != nil || present[ALPHChunk] {
+	if w.HasAlpha || (w.VP8L != nil && w.VP8L.AlphaUsed) || w.ALPH != nil || present[ALPHChunk] {
 		presentFlags |= FlagAlpha
 	}
-	if w.HasAnimation || len(w.ANMFs) > 0 || present[ANIMChunk] {
+	if w.ANIM != nil || w.HasAnimation || len(w.ANMFs) > 0 || present[ANIMChunk] {
 		presentFlags |= FlagAnimation
 	}
 
@@ -270,12 +276,21 @@ func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]b
 	// Only touch VP8X when something new is being written: create it if absent,
 	// otherwise just OR in the freshly-added flag bits.
 	if w.VP8X == nil {
-		// 缺 VP8X 但有扩展特性：创建。只影响原本就没有 VP8X 的文件（其产出本就
-		// 不合规），已带 VP8X 的流不会走到这里，故字节级往返不受影响。
-		// Create it when an extended feature is present but VP8X is missing. This
-		// only affects files that had no VP8X (whose output was already invalid),
-		// so byte-exact round-tripping of VP8X-bearing streams is unaffected.
-		if presentFlags != 0 {
+		// 缺 VP8X 且输出里确实需要它时才创建：有新写入的扩展 chunk，或流中已有
+		// 只能藏在 VP8X 之后的扩展 chunk（ICCP/EXIF/XMP/ANIM/ALPH，包括通过
+		// AddRawChunk 插入的）。创建时用当前状态整体置位（含 alpha、animation）。
+		// 只有alpha 的纯 VP8L 文件不在此列，否则会凭空多出一个 VP8X，破坏字节级
+		// 往返。
+		// Create it when VP8X is missing and the output actually needs one: either
+		// an extended chunk is being written now, or the stream already carries
+		// one that can only live behind a VP8X (ICCP/EXIF/XMP/ANIM/ALPH, including
+		// AddRawChunk inserts). The flags of the whole current state (alpha and
+		// animation included) go into the new chunk. A plain alpha-only VP8L file
+		// is not in this set, so it keeps round-tripping byte for byte.
+		needsVP8X := len(synth) > 0 ||
+			present[ICCPChunk] || present[EXIFChunk] || present[XMPChunk] ||
+			present[ANIMChunk] || present[ALPHChunk]
+		if needsVP8X {
 			w.VP8X = &VP8X{Flags: presentFlags, CanvasWidth: w.Width, CanvasHeight: w.Height}
 		}
 	} else if newFlags != 0 {
@@ -319,25 +334,19 @@ func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]b
 		}
 	}
 
-	// 插入位置：任一扩展 chunk（ICCP/EXIF/XMP/ALPH）或图像数据 chunk
-	// （VP8/VP8L/ANMF）之前，以满足容器顺序约束。
-	// Insert before any extended or image-data chunk so the container ordering
-	// constraint is satisfied.
-	idx := len(names)
-	for i, n := range names {
-		if n == VP8Chunk || n == VP8LChunk || n == ANMFChunk ||
-			n == ICCPChunk || n == EXIFChunk || n == XMPChunk || n == ALPHChunk {
-			idx = i
-			break
-		}
+	// 逐个按排位插入：VP8X 最前，ICCP 紧随其后，EXIF/XMP 落在图像数据之后的
+	// 尾部。下标先照当前列表算出，再改动 names/payloads；synthData 取同一个 i。
+	// Insert the chunks one at a time by rank: VP8X first, ICCP right after it,
+	// EXIF/XMP at the end after the image data. The index is computed from the
+	// lists as they stand before they are modified, and synthData uses the same i.
+	for i, name := range synth {
+		idx := chunkInsertIndex(names, chunkInsertRank(name))
+		names = append(names, "")
+		copy(names[idx+1:], names[idx:])
+		names[idx] = name
+		payloads = append(payloads, nil)
+		copy(payloads[idx+1:], payloads[idx:])
+		payloads[idx] = synthData[i]
 	}
-	outN := make([]FourCC, 0, len(names)+len(synth))
-	outP := make([][]byte, 0, len(payloads)+len(synth))
-	outN = append(outN, names[:idx]...)
-	outP = append(outP, payloads[:idx]...)
-	outN = append(outN, synth...)
-	outP = append(outP, synthData...)
-	outN = append(outN, names[idx:]...)
-	outP = append(outP, payloads[idx:]...)
-	return outN, outP
+	return names, payloads
 }

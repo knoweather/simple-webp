@@ -1,6 +1,7 @@
 package simple_webp
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 
@@ -91,9 +92,24 @@ func readRiffChunk(r io.Reader) (*riffChunk, error) {
 	if size > maxChunkSize {
 		return nil, errors.Errorf("invalid webp: chunk %q too large: %d bytes", string(name), size)
 	}
-	data := make([]byte, size)
-	if _, err := io.ReadFull(r, data); err != nil {
+	// 载荷流式读入：内存只随实际到达的数据增长，声明长度再大也不会预分配。
+	// io.CopyN 在数据不足时返回 io.EOF，这里统一换成 io.ErrUnexpectedEOF，
+	// 否则读循环会把它当成「流在 chunk 边界上正常结束」而静默吞掉截断。
+	// Stream the payload in, so the buffer grows with the data that actually
+	// arrives instead of the declared length. io.CopyN reports io.EOF when the
+	// stream is short, which is turned into io.ErrUnexpectedEOF: the parse loop
+	// treats io.EOF as a clean end of stream and would swallow the truncation.
+	buf := bytes.NewBuffer(nil)
+	n, err := io.CopyN(buf, r, int64(size))
+	if n != int64(size) {
+		if err == nil || errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return nil, errors.WithMessagef(err, "invalid webp: can not read chunk %q data", string(name))
+	}
+	data := buf.Bytes()
+	if size == 0 {
+		data = []byte{}
 	}
 	if size&1 == 1 {
 		var pad [1]byte
