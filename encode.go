@@ -92,7 +92,7 @@ func EncodeBytes(m image.Image, opt *EncodeOptions) ([]byte, error) {
 		return nil, errors.Wrap(err, "webp: vp8l encode")
 	}
 
-	chunks, err := encodeChunks(VP8LChunk, payload, b.Dx(), b.Dy(), iccp, exif, xmp)
+	chunks, err := encodeChunks(VP8LChunk, payload, b.Dx(), b.Dy(), iccp, exif, xmp, nil)
 	if err != nil {
 		return nil, err
 	}

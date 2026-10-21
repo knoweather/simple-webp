@@ -44,6 +44,19 @@ type LossyOptions struct {
 	// XMP is the embedded XMP metadata; when it is non-empty a flagged VP8X and
 	// an XMP chunk are written.
 	XMP []byte
+	// AlphaFilter 选择 ALPH 的行滤波方式：0 不滤波（默认）、1 水平、2 垂直、
+	// 3 梯度；其它值返回错误。滤波只影响 alpha 的压缩率，不改变像素值。
+	//
+	// AlphaFilter selects the ALPH row filter: 0 none (the default), 1
+	// horizontal, 2 vertical, 3 gradient; any other value is an error. The
+	// filter changes only the compressed size, never the alpha values.
+	AlphaFilter uint8
+	// AlphaUncompressed 为 true 时 alpha 平面按 C=0 原样存储；默认按 C=1 用
+	// VP8L 无损压缩。两种方式都不量化 alpha。
+	//
+	// AlphaUncompressed stores the alpha plane verbatim (C=0); by default it is
+	// compressed losslessly with VP8L (C=1). Neither mode quantises the alpha.
+	AlphaUncompressed bool
 }
 
 // defaultLossyQuality 是未指定质量时使用的取值。
@@ -66,15 +79,17 @@ func EncodeLossy(w io.Writer, m image.Image, opt *LossyOptions) error {
 // EncodeLossyBytes 把 m 编码为完整的有损 WebP 文件并保留在内存中返回。
 // 非空的 ICCP/EXIF/XMP 直接随文件写出；三者都为空时输出仍是不带 VP8X 的简单容器。
 //
+// 带透明度的输入写成扩展格式：VP8X（Alpha 位）+ ALPH + VP8，alpha 平面无损
+// 压缩（或按 AlphaUncompressed 原样存储），完全不透明的输入仍走简单格式。
+//
 // EncodeLossyBytes encodes m as a lossy WebP file held in memory. Non-empty
 // ICCP/EXIF/XMP are written straight into the file; when all three are empty
 // the output is still the simple container without a VP8X chunk.
 //
-// 有损格式只承载亮度与色度，alpha 通道不参与编码：需要保留透明度时应改用
-// EncodeBytes 写出无损图像。
-//
-// The lossy format carries luma and chroma only, so the alpha channel takes no
-// part in the encoding: use EncodeBytes to keep transparency.
+// An input with transparency is written in the extended format: VP8X (alpha
+// flag) + ALPH + VP8, with the alpha plane compressed losslessly (or stored
+// verbatim with AlphaUncompressed); a fully opaque input still uses the simple
+// format.
 //
 // A Quality outside 0..100 returns an error rather than being clamped.
 func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
@@ -87,6 +102,8 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 	}
 	quality := defaultLossyQuality
 	var iccp, exif, xmp []byte
+	var alphaFilter uint8
+	var alphaUncompressed bool
 	if opt != nil {
 		if opt.QualityZero {
 			quality = opt.Quality
@@ -94,9 +111,14 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 			quality = opt.Quality
 		}
 		iccp, exif, xmp = opt.ICCP, opt.EXIF, opt.XMP
+		alphaFilter = opt.AlphaFilter
+		alphaUncompressed = opt.AlphaUncompressed
 	}
 	if quality < 0 || quality > 100 {
 		return nil, errors.Errorf("webp: quality %d out of range 0..100", quality)
+	}
+	if alphaFilter > ALPHFilterGradient {
+		return nil, errors.Errorf("webp: unsupported alpha filter %d", alphaFilter)
 	}
 
 	ycc := imageToYCbCr420(m)
@@ -105,7 +127,15 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 		return nil, errors.Wrap(err, "webp: vp8 encode")
 	}
 
-	chunks, err := encodeChunks(VP8Chunk, payload, b.Dx(), b.Dy(), iccp, exif, xmp)
+	var alpha []byte
+	if plane, hasAlpha := alphaPlane(m); hasAlpha {
+		alpha, err = encodeAlphaChunk(plane, b.Dx(), b.Dy(), alphaFilter, alphaUncompressed)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	chunks, err := encodeChunks(VP8Chunk, payload, b.Dx(), b.Dy(), iccp, exif, xmp, alpha)
 	if err != nil {
 		return nil, err
 	}

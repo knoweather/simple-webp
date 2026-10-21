@@ -35,11 +35,12 @@ func marshalWebpFile(chunks []riffChunk) ([]byte, error) {
 }
 
 // encodeChunks 按容器顺序拼出 chunk 序列：有元数据时先写带标志位的 VP8X，
-// 然后 ICCP、图像数据、EXIF、XMP。
+// 然后 ICCP、ALPH（若有）、图像数据、EXIF、XMP。
 //
 // encodeChunks assembles the chunk sequence in container order: a flagged VP8X
-// first when metadata is present, then ICCP, the image data, EXIF and XMP.
-func encodeChunks(imageChunk FourCC, payload []byte, width, height int, iccp, exif, xmp []byte) ([]riffChunk, error) {
+// first when metadata or an alpha plane is present, then ICCP, ALPH, the image
+// data, EXIF and XMP.
+func encodeChunks(imageChunk FourCC, payload []byte, width, height int, iccp, exif, xmp, alpha []byte) ([]riffChunk, error) {
 	if width <= 0 || height <= 0 || width > 1<<24 || height > 1<<24 {
 		return nil, errors.Errorf("webp: image size %dx%d out of range", width, height)
 	}
@@ -53,7 +54,10 @@ func encodeChunks(imageChunk FourCC, payload []byte, width, height int, iccp, ex
 	if len(xmp) > 0 {
 		flags |= FlagXMP
 	}
-	chunks := make([]riffChunk, 0, 5)
+	if alpha != nil {
+		flags |= FlagAlpha
+	}
+	chunks := make([]riffChunk, 0, 6)
 	if flags != 0 {
 		p := make([]byte, 10)
 		p[0] = flags
@@ -63,6 +67,9 @@ func encodeChunks(imageChunk FourCC, payload []byte, width, height int, iccp, ex
 	}
 	if len(iccp) > 0 {
 		chunks = append(chunks, riffChunk{name: ICCPChunk, data: iccp})
+	}
+	if alpha != nil {
+		chunks = append(chunks, riffChunk{name: ALPHChunk, data: alpha})
 	}
 	chunks = append(chunks, riffChunk{name: imageChunk, data: payload})
 	if len(exif) > 0 {
