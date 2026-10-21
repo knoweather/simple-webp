@@ -20,14 +20,17 @@ preserved, byte-exact write back.
 | Capability | Status | Notes |
 |---|---|---|
 | RIFF/WEBP container | ✅ | `VP8 `/`VP8L`/`VP8X`/`ALPH`/`ANIM`/`ANMF`/`ICCP`/`EXIF`/`XMP `, incl. padding |
+| Strict parsing | ✅ | `ParseOptions.Strict` checks the spec MUST rules (chunk order, VP8X first, reserved bits, canvas area, frame inside canvas, no ALPH on VP8L, zero padding); the default stays lenient |
 | VP8L lossless decode | ✅ | 4 transforms (predictor/color/subtract-green/color-indexing), meta-Huffman, LZ77, color cache |
 | VP8 lossy decode | ✅ | bool decoder, keyframe header, partitions, coefficient trees, 16x16/8x8/4x4 prediction, WHT+IDCT, loop filter |
 | ALPH transparency | ✅ | uncompressed (3 row filters) and VP8L-compressed alpha |
-| Animation | ✅ | `ANIM`/`ANMF`, dispose/blend compositing, canvas-sized frame sequence |
-| image interface | ✅ | `ToImage()`, `*Webp` implements `image.Image`, `image.RegisterFormat("webp", ...)` |
-| Metadata editing | ✅ | rewrite with `ICCP`/`EXIF`/`XMP ` chunks, **pixels never re-encoded**, byte-exact when untouched |
-| VP8L lossless encode | ✅ | color-indexing / subtract-green / predictor / LZ77 / Huffman (≤15 bits) |
-| VP8 lossy encode | ✅ | intra only: rate-distortion mode decision, 16x16 or 4x4 luma modes, 8x8 chroma modes, one quantizer, no loop filter, no rate control |
+| Animation | ✅ | `ANIM`/`ANMF`, dispose/blend compositing, canvas-sized frame sequence, `FrameAt` decodes one frame without cloning the others |
+| image interface | ✅ | `ToImage()`, `*Webp` implements `image.Image`, `image.RegisterFormat("webp", ...)`, `PixelFormatYCbCr` for lossy stills |
+| Metadata editing | ✅ | rewrite with `ICCP`/`EXIF`/`XMP ` chunks, **pixels never re-encoded**, byte-exact when untouched; new chunks land where the spec puts their type |
+| Container editing | ✅ | `NewWebp` + `SetImage` build a file from scratch, `AddFrame`/`RemoveFrame` edit animations, `DeleteRawChunk` removes consumed chunks, `InvalidateCache` drops the decode cache |
+| VP8L lossless encode | ✅ | color-indexing / subtract-green / predictor / **color transform** / **color cache** / **meta-Huffman groups** / LZ77 / Huffman (≤15 bits); the cheaper of the variants is kept |
+| VP8 lossy encode | ✅ | intra only: rate-distortion mode decision, 16x16 or 4x4 luma modes, 8x8 chroma modes, **loop filter**, **target-size rate control**; lossy + alpha (`VP8X`+`ALPH`) |
+| Animation encode | ✅ | `EncodeAnimation` writes `VP8X`+`ANIM`+`ANMF`, lossless or lossy frames, per-frame `ALPH` |
 
 ## Install
 
@@ -87,6 +90,73 @@ refused: nothing is deleted and the call returns 0. Unknown sub-chunks inside an
 `ANMF` frame keep their original position, so frame-level application data
 survives a parse/write cycle.
 
+### Strict parsing
+
+```go
+w, err := simple_webp.ParseWebpWith(r, simple_webp.ParseOptions{Strict: true, VerifySize: true})
+```
+
+`Strict` enables the spec MUST checks and reports the first violation; the
+default (and `ParseWebp`) stays lenient so real world files that break the rules
+still parse.
+
+### Decode to YCbCr
+
+```go
+img, err := w.ToImageWith(simple_webp.DecodeOptions{Format: simple_webp.PixelFormatYCbCr})
+```
+
+Lossy stills hand back the decoder's `*image.YCbCr` without the YUV to RGB
+conversion. Lossless bitstreams, alpha planes and animations have no YCbCr form
+and return `ErrUnsupported`.
+
+### Encode with metadata
+
+```go
+err := simple_webp.Encode(out, img, &simple_webp.EncodeOptions{
+    ICCP: iccProfile,
+    EXIF: exifPacket,
+    XMP:  xmpPacket,
+})
+```
+
+The metadata turns into a flagged `VP8X` plus the chunks in container order; an
+encode without metadata stays byte identical to before. `LossyOptions` carries
+the same three fields.
+
+### Lossy + alpha, and animation
+
+```go
+err := simple_webp.EncodeLossy(out, img, &simple_webp.LossyOptions{
+    Quality:      80,
+    FilterLevel:  20,              // VP8 loop filter 0..63; 0 derives it from the quality
+    TargetBytes:  0,               // >0: pick the quality closest to a size
+    AlphaFilter:  simple_webp.ALPHFilterGradient,
+})
+```
+
+A transparent input is written as `VP8X`(alpha) + `ALPH` + `VP8 `; the alpha plane
+is lossless. Animations are written from a canvas and a frame list:
+
+```go
+err := simple_webp.EncodeAnimation(out, &simple_webp.Animation{
+    CanvasWidth: 320, CanvasHeight: 240,
+    LoopCount: 0,
+    Frames: []simple_webp.Frame{{Image: frame, Duration: 100, Blend: true}},
+}, &simple_webp.AnimationOptions{Lossy: true})
+```
+
+### Build or edit a container
+
+```go
+w := simple_webp.NewWebp(0, 0)
+w.SetImage(img, &simple_webp.ImageOptions{Lossy: true})
+_ = w.AddFrame(frame)          // animations: append a frame
+_ = w.RemoveFrame(0)           // …and drop one
+w.InvalidateCache()            // after mutating parsed structs directly
+out, err := w.MarshalBytes()
+```
+
 ### Animation
 
 ```go
@@ -118,8 +188,9 @@ err := simple_webp.EncodeLossy(out, img, &simple_webp.LossyOptions{
 })
 ```
 
-Lossy WebP carries luma and chroma only, so the alpha channel is dropped;
-`EncodeBytes` is the lossless path to use when transparency matters.
+A transparent input makes the lossy encoder write the extended format
+(`VP8X` with the alpha flag, `ALPH`, `VP8 `) with a lossless alpha plane; use
+`EncodeBytes` when you want lossless pixels instead.
 
 The lossy encoder chooses its modes by rate distortion. Every candidate mode
 is predicted, transformed and quantized, and the candidates are scored on the
@@ -149,15 +220,21 @@ func (c *myChunk) Parse(chunk *simple_webp.RawChunk) error { c.Data = chunk.Data
 webp.go        Webp struct / ParseWebp / chunk consumption & in-order snapshot
 riff.go        RIFF primitives: FourCC, little-endian lengths, padding, R/W
 chunk.go       VP8X / VP8 / VP8L / ALPH / ANIM / ANMF / ICCP / EXIF / XMP
+strict.go      spec MUST validation behind ParseOptions.Strict
+edit.go        NewWebp / SetImage / AddFrame / RemoveFrame / InvalidateCache
 writer.go      WriteTo / MarshalBytes (in-order write back, lengths & padding recomputed)
-decode.go      ToImage / ToImageWith, lossy & lossless dispatch
+container_write.go  RIFF assembly shared by the encoders
+decode.go      ToImage / ToImageWith / lossy & lossless dispatch / YCbCr output
 alpha.go       ALPH inflate, alpha row-filter inverse transform, compositing
-animation.go   ANMF frame compositing (blend / dispose)
+alpha_encode.go  ALPH payload: filtering and VP8L compression of alpha
+animation.go   ANMF frame compositing (blend / dispose), FrameAt / AnimationInfo
+animation_encode.go  animation writer (VP8X + ANIM + ANMF)
 vp8.go         VP8 → NRGBA (9:3:3:1 fancy upsampling + fixed-point BT.601)
 image.go       image.RegisterFormat / Decode / DecodeConfig / image.Image
 encode.go      image.Image → VP8L → RIFF
-internal/vp8/  VP8 lossy decoder + encoder (bool coder, prediction, IDCT, loop filter, RD mode decision)
-internal/vp8l/ VP8L lossless decoder + encoder (bitstream, Huffman, LZ77, transforms)
+encode_lossy.go  image.Image → VP8 (+ ALPH) → RIFF
+internal/vp8/  VP8 lossy decoder + encoder (bool coder, prediction, IDCT, loop filter, RD mode decision, rate control)
+internal/vp8l/ VP8L lossless decoder + encoder (bitstream, Huffman, LZ77, transforms, colour cache, colour transform, meta-Huffman)
 testdata/      fixtures generated against libwebp (.webp + .rgba references)
 ```
 
@@ -173,31 +250,34 @@ Fixtures are all generated by libwebp (Pillow) and compared pixel by pixel:
 **VP8/VP8L decode produces YUV/ARGB planes byte-identical to the reference
 implementation** (loop filter and animation compositing included), and the
 **final RGBA output is pixel-identical to libwebp** (fancy upsampling and
-fixed-point BT.601 included). Encoded files decode correctly in libwebp and
-match the source pixel-for-pixel.
+fixed-point BT.601 included). Encoded files are checked by decoding them with
+this library and by the strict container validation; a fresh libwebp cross-check
+was not possible in the environment this series was developed in, so it is not
+claimed here.
 
 ## Benchmark
 
-Windows/amd64, Ryzen 7 7840HS, `go test -bench . -benchtime 1s`:
+Windows/amd64, `go test -run XXX -bench . -benchtime 200ms`, re-measured after
+the container and encoder work in this series:
 
-| Scenario | simple-webp | reference (x/image) | libwebp 1.5.0 (C) |
-|---|---|---|---|
-| container parse (320×240, 37 KB) | **8.6 µs** (4.3 GB/s) | — | — |
-| VP8L lossless decode (320×240) | 3.45 ms (22.3 MP/s) | 2.86 ms (26.9 MP/s) | 1.3–3.4× faster |
-| VP8 lossy decode, YUV only (400×300) | **1.02 ms** (117.8 MP/s) | 1.08 ms (111.4 MP/s) | — |
-| VP8 lossy decode + RGB (400×300) | 4.52 ms → **1.42 ms** (optimized, CT) | not supported | 0.208 ms (single-thread ≈ 6.8× slower) |
-| VP8 lossy encode (400×300) | 33.2 ms (3.6 MP/s) | not supported | — |
-| VP8 lossy encode (640×480) | 84.4 ms (3.6 MP/s) | not supported | — |
+| Scenario | simple-webp | reference (x/image) |
+|---|---|---|
+| container parse (320×240, 37 KB) | **17.3 µs** (2.2 GB/s) | — |
+| VP8L lossless decode (320×240, 320×240 photo) | 2.15 ms (35.7 MP/s) | 1.61 ms (47.6 MP/s) |
+| VP8 lossy decode (400×300) | **1.19 ms** (101 MP/s) | 0.67 ms (179 MP/s) |
+| VP8L lossless encode (320×240) | 35.6 ms (2.16 MP/s) | not supported |
 
-> The libwebp column comes from a single thread on a different machine
-> (libwebp 1.5.0 `WebPDecodeRGBA`), scale reference only. Lossy decoding got a
-> YUV→RGB lookup-table + 16-row concurrent optimization, hence the optimized
-> numbers.
+> The numbers above come from one run on the machine used for this series and
+> are rounded; earlier libwebp comparisons were measured on a different machine
+> and are not reproduced here because `cwebp`/`dwebp` are not available in this
+> environment.
 
-Lossless decoding is ~20% slower than the reference (bit-by-bit Huffman, no
-table-driven fast path yet); core VP8 decoding is slightly faster. Encoding
-runs at ~4 MP/s with output sizes 1.5–2× of `cwebp -lossless -m 6` (no
-meta-Huffman / color transform yet).
+Lossless decoding is slower than the reference (bit-by-bit Huffman, no
+table-driven fast path yet); core VP8 decoding is slower after the loop filter
+was added on the encode side, which does not change the decoder. Lossless
+encoding now tries the colour-transform, colour-cache and meta-Huffman variants
+and keeps the shortest stream, so it is slower than before and its output is
+smaller; the size ratio against `cwebp` was not re-measured here.
 
 ## Known limitations
 
@@ -209,46 +289,53 @@ meta-Huffman / color transform yet).
   distortion: every candidate goes through prediction, the forward transform
   and quantisation, and the candidates are scored on the quantised distortion
   plus the exact number of bits their tokens would take. The luma uses either
-  one 16x16 mode or sixteen 4x4 modes, whichever is cheaper, the chroma uses
-  8x8 modes, and the quantiser index is fixed for the frame. There is no loop
-  filter and no rate control. Output is a valid stream any VP8 decoder accepts,
-  but at matched PSNR the files are still larger than what `cwebp` 1.5.0
-  produces (about 1.2-1.4x when measured on a 320×240 photo; that figure
-  predates the rate-distortion work above, which is roughly 7% smaller), because
-  the loop filter and the rate control are missing
+  one 16x16 mode or sixteen 4x4 modes, whichever is cheaper and the chroma uses
+  8x8 modes. The loop filter and a target-size rate control are in; the rate
+  control moves the global quantiser only, per-segment quantization is still
+  open, so the size at a given quality still depends on the content
 - Lossy encoding runs twice: the first pass collects token statistics and the
   second encodes with probabilities adapted to them, which costs about 1.8x the
   time of a single pass. The mode search runs only in the first pass, the
   second reuses the modes it found
 - The rate distortion search is what makes the encoder slow: scoring ten 4x4
   modes for every block of every macroblock means running the transform and
-  the quantiser once per candidate. Encoding a 320×240 photo takes 18 ms
-  against 5 ms before, so the whole encoder is about 3.5x slower
-- The encoder implements neither color transform nor meta-Huffman blocked
-  coding, so compression is weaker than `cwebp`
+  the quantiser once per candidate
+- Lossless encoding now encodes up to four variants (colour transform on or off,
+  colour cache, meta-Huffman groups) and keeps the shortest stream, so it costs
+  several times the old single-pass encode; the container tests only assert the
+  decoded pixels, not the exact bytes
+- The meta-Huffman implementation uses two groups of 16×16 blocks clustered by
+  their symbol histograms. It wins on content whose regions use different symbol
+  sets, but with the Method 2 predictor a single tree set usually wins, in which
+  case the stream is left unchanged
 - `ALPH` `preprocessing=1` (level reduction) is passed through as-is, without
-  the reference dithering; cwebp does not produce that mode by default
-- Lossless Huffman decodes bit by bit — large images ~20% slower than the reference
-- Animation is read-only (no animation encoder)
+  the reference dithering; cwebp does not produce that mode by default. The
+  encoder writes `preprocessing=0` and does not quantise alpha at all
+- Lossless Huffman decodes bit by bit — large images slower than the reference
 - `DeleteRawChunk` reports how many chunks it removed but not why a removal was
   refused: 0 means either no chunk of that type was present or the removal would
   have left the file invalid
+- `DeleteRawChunk` cannot report an error because its signature returns an int;
+  a refused removal therefore looks like "nothing removed"
 - **WebP contains no VP9**: WebP's two codecs are VP8 (lossy, `VP8 ` chunk)
   and VP8L (lossless, `VP8L` chunk). VP9 is a different codec used in
   WebM/Matroska containers and unrelated to this library
 
 ## Roadmap
 
-The lossy encoder is intra only by design. The rate-distortion mode decision
-and the 4x4 intra modes are in; what is left between it and `cwebp` is:
+The lossy encoder is intra only by design. The rate-distortion mode decision, the
+4x4 intra modes, the loop filter and a global rate control are in; what is left
+between it and `cwebp` is:
 
-- **Rate control.** The quantiser index is fixed for the whole frame, so the
-  size of the output is whatever the image happens to need at that quality. A
-  target-bitrate mode would have to move the quantiser per macroblock, which
-  the frame header supports through the per-segment deltas.
-- **Loop filter.** Deliberately absent: this decoder filters after the whole
-  frame, so filtering cannot improve prediction, and what it buys is
-  subjective smoothness rather than PSNR at a given size.
+- **Per-segment quantization.** The quantiser index is still fixed for the whole
+  frame, so a complex region and a flat one share the same step. The frame header
+  already supports per-segment deltas; wiring the macroblock activity into them
+  is the next step for target-size accuracy.
+- **More Huffman groups and better clustering.** The meta prefix codes use two
+  groups; libwebp clusters into more groups and also handles the mixed
+  photo/text case that way.
+- **Multi-token partitions.** The frame still uses a single residual partition,
+  which limits decoder parallelism but not size.
 
 ## Safety / pixel budget
 
