@@ -6,19 +6,79 @@ import (
 	"github.com/pkg/errors"
 )
 
+// defaultMaxTotalPixels 限制一次 Frames 调用返回的全部帧像素总数（画布像素 ×
+// 帧数）：1<<27 个像素对应 512 MB 的 NRGBA 缓冲，与单张图的预算一致。
+//
+// defaultMaxTotalPixels bounds the pixels of every frame returned by one Frames
+// call (canvas pixels times frame count): 1<<27 pixels is 512 MB of NRGBA
+// buffers, the same budget as a single image.
+const defaultMaxTotalPixels = 1 << 27
+
+// FrameOptions 调节动图解码。
+//
+// FrameOptions tunes animation decoding.
+type FrameOptions struct {
+	// MaxPixels 拒绝画布像素数超过该值的动画，0 表示 defaultMaxPixels。
+	// 画布尺寸来自 VP8X，可能远大于实际帧，所以它必须单独受预算约束。
+	//
+	// MaxPixels rejects animations whose canvas is larger; 0 uses
+	// defaultMaxPixels. The canvas comes from VP8X and can be far larger than
+	// the frames themselves, so it needs a budget of its own.
+	MaxPixels int
+	// MaxTotalPixels 拒绝画布像素 × 帧数超过该值的动画，0 表示
+	// defaultMaxTotalPixels。Frames 会一次性返回全部帧，总量必须有上限。
+	//
+	// MaxTotalPixels rejects animations whose canvas times frame count exceeds
+	// it; 0 uses defaultMaxTotalPixels. Frames returns every frame at once, so
+	// the total has to be bounded.
+	MaxTotalPixels int
+}
+
 // Frames 逐帧解码动图，返回按画布尺寸合成的各帧（NRGBA）及其显示时长
-// （毫秒）。每帧先解码为静止图像再混合到画布上，随后克隆整块画布作为输出帧。
-// maxPixels 像素预算会透传给子解码器，用于限制单帧解码规模。
+// （毫秒）。maxPixels 像素预算同时约束画布尺寸与单帧解码规模，0 表示
+// defaultMaxPixels；等价于 FramesWith(FrameOptions{MaxPixels: maxPixels})。
 //
 // Frames decodes every frame of an animated file and returns the composited
 // frames at canvas size together with their display duration in milliseconds.
-// Each frame is decoded as a still image, blended onto the canvas, and the
-// whole canvas is then cloned as the output frame. The maxPixels budget is
-// forwarded to the sub-decoders to cap per-frame decoding size.
+// The maxPixels budget caps both the canvas size and the per-frame decoding
+// size; 0 means defaultMaxPixels. It is FramesWith(FrameOptions{MaxPixels:
+// maxPixels}).
 func (w *Webp) Frames(maxPixels int) ([]*image.NRGBA, []int, error) {
+	return w.FramesWith(FrameOptions{MaxPixels: maxPixels})
+}
+
+// FramesWith 按给定选项逐帧解码动图，见 Frames。每帧先解码为静止图像再混合到
+// 画布上，随后克隆整块画布作为输出帧；画布尺寸与「画布 × 帧数」的总量都会在
+// 分配像素缓冲之前按预算预检，超限返回 ErrImageTooLarge。
+//
+// FramesWith decodes an animated file frame by frame with the given options,
+// see Frames. Each frame is decoded as a still image, blended onto the canvas,
+// and the whole canvas is then cloned as the output frame. The canvas size and
+// the canvas-times-frames total are checked against the budget before any pixel
+// buffer is allocated; exceeding it returns ErrImageTooLarge.
+func (w *Webp) FramesWith(opt FrameOptions) ([]*image.NRGBA, []int, error) {
 	if len(w.ANMFs) == 0 {
 		return nil, nil, errors.New("webp: not an animated file")
 	}
+	maxPixels := opt.MaxPixels
+	if maxPixels <= 0 {
+		maxPixels = defaultMaxPixels
+	}
+	if w.Width <= 0 || w.Height <= 0 {
+		return nil, nil, errors.Errorf("webp: bad canvas size %dx%d", w.Width, w.Height)
+	}
+	canvasPixels := int64(w.Width) * int64(w.Height)
+	if canvasPixels > int64(maxPixels) {
+		return nil, nil, errors.Wrapf(ErrImageTooLarge, "%dx%d canvas", w.Width, w.Height)
+	}
+	maxTotal := opt.MaxTotalPixels
+	if maxTotal <= 0 {
+		maxTotal = defaultMaxTotalPixels
+	}
+	if canvasPixels*int64(len(w.ANMFs)) > int64(maxTotal) {
+		return nil, nil, errors.Wrapf(ErrImageTooLarge, "%dx%d canvas x %d frames", w.Width, w.Height, len(w.ANMFs))
+	}
+
 	canvas := image.NewNRGBA(image.Rect(0, 0, w.Width, w.Height))
 	frames := make([]*image.NRGBA, 0, len(w.ANMFs))
 	durations := make([]int, 0, len(w.ANMFs))

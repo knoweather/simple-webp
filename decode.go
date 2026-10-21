@@ -70,7 +70,7 @@ func (w *Webp) ToImageWith(opt DecodeOptions) (image.Image, error) {
 	if maxPixels <= 0 {
 		maxPixels = defaultMaxPixels
 	}
-	if w.Width <= 0 || w.Height <= 0 || w.Width*w.Height > maxPixels {
+	if w.Width <= 0 || w.Height <= 0 || int64(w.Width)*int64(w.Height) > int64(maxPixels) {
 		return nil, errors.Wrapf(ErrImageTooLarge, "%dx%d", w.Width, w.Height)
 	}
 

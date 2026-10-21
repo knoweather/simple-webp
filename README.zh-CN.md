@@ -90,6 +90,10 @@ for i, f := range frames {
 }
 ```
 
+`Frames` 会按像素预算拒绝过大的画布（返回 `ErrImageTooLarge`）；因为它一次性返回
+全部帧，还会用 `FrameOptions.MaxTotalPixels` 约束「画布像素 × 帧数」总量。
+`FramesWith(FrameOptions{...})` 可以同时设置两者，画布在分配任何像素缓冲之前就被检查。
+
 ### 编码
 
 ```go
@@ -239,6 +243,9 @@ color transform）。
   而不是当成流正常结束。
 - RIFF File Size 之后的数据一律忽略（规范允许）；`verifySize` 仍会拒绝大小字段与
   实际长度不符的流。
+- `Frames` 在分配画布之前按像素预算检查 VP8X 声明的画布，并用
+  `FrameOptions.MaxTotalPixels` 约束「画布 × 帧数」的像素总量：16383×16383 的画布
+  配一帧 1×1，会在分配之前被拒绝。
 - 已用 `TestToImageWithDefaultBudget` 单测 + 单 worker fuzz 验证：最大声明头被零分配拒绝，
   不会触发 OOM。
 

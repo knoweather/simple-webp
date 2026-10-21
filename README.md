@@ -96,6 +96,11 @@ for i, f := range frames {
 }
 ```
 
+`Frames` rejects a canvas larger than the pixel budget with `ErrImageTooLarge`,
+and because it returns every frame at once it also bounds `canvas pixels ×
+frames` through `FrameOptions.MaxTotalPixels`; `FramesWith(FrameOptions{...})`
+sets both, and the canvas is checked before any pixel buffer is allocated.
+
 ### Encode
 
 ```go
@@ -260,6 +265,9 @@ budget **after reading the header and before allocating pixel buffers**:
   holds is an error rather than a silent end of stream
 - data after the RIFF File Size is ignored, as the spec allows; `verifySize`
   still rejects a stream whose size field does not match the actual length
+- `Frames` checks the VP8X canvas against the budget before allocating it and
+  bounds the total `canvas × frames` pixels, so a 16383×16383 canvas carrying a
+  1×1 frame is rejected without the allocation
 - covered by `TestToImageWithDefaultBudget` and single-worker fuzzing: the
   worst-case bogus header is rejected with zero allocations, no OOM
 

@@ -2,6 +2,7 @@ package simple_webp
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -284,6 +285,77 @@ func TestDeleteConsumedChunks(t *testing.T) {
 	}
 	if n := w.DeleteRawChunk(VP8LChunk); n != 0 {
 		t.Fatalf("the only VP8L image data was deleted: %d", n)
+	}
+}
+
+// TestFramesRejectsOversizedCanvas 覆盖 F-06：画布尺寸必须受像素预算约束，
+// 不能因为帧很小就放行一个巨大的 VP8X 画布。
+//
+// TestFramesRejectsOversizedCanvas covers F-06: the canvas size is subject to
+// the pixel budget, so tiny frames cannot smuggle in a huge VP8X canvas.
+func TestFramesRejectsOversizedCanvas(t *testing.T) {
+	frame := make([]byte, 16)
+	writeUint24(frame[6:9], 0)  // 宽 1 / width 1
+	writeUint24(frame[9:12], 0) // 高 1 / height 1
+	frame = append(frame, chunkBytes("VP8 ", vp8Payload(1, 1))...)
+	stream := buildWebp(
+		chunkBytes("VP8X", vp8xPayload(FlagAnimation, 16383, 16383)),
+		chunkBytes("ANIM", make([]byte, 6)),
+		chunkBytes("ANMF", frame),
+	)
+	w, err := ParseWebpBytes(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, _, err := w.Frames(1 << 20); !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("frames of a 16383x16383 canvas: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 32<<20 {
+		t.Fatalf("frames allocated %d bytes before rejecting the canvas", grew)
+	}
+	// 0 走默认预算，同样必须拒绝 / 0 means the default budget, also refused
+	if _, _, err := w.Frames(0); !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("default budget: %v", err)
+	}
+}
+
+// TestFramesTotalBudget 覆盖 F-06 的总量预算：画布像素 × 帧数必须受
+// FrameOptions.MaxTotalPixels 约束，边界之内仍能正常解码。
+//
+// TestFramesTotalBudget covers the F-06 total budget: canvas pixels times frame
+// count is bounded by FrameOptions.MaxTotalPixels, while a value at the limit
+// still decodes.
+func TestFramesTotalBudget(t *testing.T) {
+	w, err := ParseWebpBytes(readFixture(t, "anim.webp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.ANMFs) == 0 {
+		t.Skip("fixture is not animated")
+	}
+	total := int64(w.Width) * int64(w.Height) * int64(len(w.ANMFs))
+	if total <= 1 {
+		t.Skipf("fixture total is %d pixels", total)
+	}
+	if _, _, err := w.FramesWith(FrameOptions{MaxPixels: 1 << 20, MaxTotalPixels: int(total) - 1}); !errors.Is(err, ErrImageTooLarge) {
+		t.Fatalf("total budget just below %d pixels: %v", total, err)
+	}
+	frames, durations, err := w.FramesWith(FrameOptions{MaxPixels: 1 << 20, MaxTotalPixels: int(total)})
+	if err != nil {
+		t.Fatalf("total budget at the limit: %v", err)
+	}
+	if len(frames) != len(w.ANMFs) || len(durations) != len(w.ANMFs) {
+		t.Fatalf("decoded %d frames and %d durations, want %d", len(frames), len(durations), len(w.ANMFs))
+	}
+	// Frames(maxPixels) 与 FramesWith 走同一条路径
+	// Frames(maxPixels) takes the same path as FramesWith
+	if _, _, err := w.Frames(1 << 20); err != nil {
+		t.Fatalf("Frames: %v", err)
 	}
 }
 
