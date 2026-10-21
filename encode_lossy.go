@@ -16,10 +16,20 @@ import (
 //
 // LossyOptions tunes the lossy (VP8) encoder.
 type LossyOptions struct {
-	// Quality 取 0（体积最小）到 100（质量最高）；零值等同于 75。
+	// Quality 取 0（体积最小）到 100（质量最高）；超出 0..100 返回错误，不静默钳制。
+	// 零值默认等同于 75，除非 QualityZero 为 true。
 	//
-	// Quality runs from 0 (smallest) to 100 (best); the zero value means 75.
+	// Quality runs from 0 (smallest) to 100 (best); a value outside 0..100
+	// returns an error instead of being silently clamped. The zero value means
+	// the default 75 unless QualityZero is set.
 	Quality int
+	// QualityZero 让 Quality 的零值表示「质量 0」而不是默认的 75。
+	// 不设置时保持旧语义：Quality == 0 等于默认质量。
+	//
+	// QualityZero makes the zero value of Quality mean quality 0 instead of
+	// the default 75. When it is false the old meaning stays: Quality == 0
+	// selects the default quality.
+	QualityZero bool
 }
 
 // defaultLossyQuality 是未指定质量时使用的取值。
@@ -48,6 +58,8 @@ func EncodeLossy(w io.Writer, m image.Image, opt *LossyOptions) error {
 //
 // The lossy format carries luma and chroma only, so the alpha channel takes no
 // part in the encoding: use EncodeBytes to keep transparency.
+//
+// A Quality outside 0..100 returns an error rather than being clamped.
 func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 	if m == nil {
 		return nil, errors.New("webp: nil image")
@@ -57,8 +69,15 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 		return nil, errors.New("webp: empty image")
 	}
 	quality := defaultLossyQuality
-	if opt != nil && opt.Quality != 0 {
-		quality = opt.Quality
+	if opt != nil {
+		if opt.QualityZero {
+			quality = opt.Quality
+		} else if opt.Quality != 0 {
+			quality = opt.Quality
+		}
+	}
+	if quality < 0 || quality > 100 {
+		return nil, errors.Errorf("webp: quality %d out of range 0..100", quality)
 	}
 
 	ycc := imageToYCbCr420(m)

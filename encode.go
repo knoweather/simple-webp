@@ -25,11 +25,14 @@ type EncodeOptions struct {
 	// caller that never set it into a lossy encoder.
 	Lossless bool
 	// Method 以速度换压缩率：0 只存储字面量，1 追加减绿（subtract green）
-	// 变换、颜色索引和 LZ77，2（默认）再应用预测器变换。
+	// 变换、颜色索引和 LZ77，2（默认）再应用预测器变换。取值必须是 0、1 或 2；
+	// 越界的 Method 不会被静默兜底，而是返回错误。
 	//
 	// Method trades speed for size: 0 stores literals only, 1 adds the
 	// subtract green transform, colour indexing and LZ77, 2 (the default)
-	// also applies a predictor transform.
+	// also applies a predictor transform. Only 0, 1 and 2 are accepted; an
+	// out-of-range Method is not silently fallen back to the default but
+	// returns an error.
 	Method int
 }
 
@@ -57,7 +60,10 @@ func EncodeBytes(m image.Image, opt *EncodeOptions) ([]byte, error) {
 		return nil, errors.New("webp: empty image")
 	}
 	method := 2
-	if opt != nil && opt.Method >= 0 && opt.Method <= 2 {
+	if opt != nil {
+		if opt.Method < 0 || opt.Method > 2 {
+			return nil, errors.Errorf("webp: unsupported Method %d (supported: 0, 1, 2)", opt.Method)
+		}
 		method = opt.Method
 	}
 

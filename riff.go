@@ -53,6 +53,10 @@ const maxChunkSize = 1 << 30
 type riffChunk struct {
 	name FourCC
 	data []byte
+	// pad 是载荷长度为奇数时读入的填充字节；规范要求它为 0，严格模式会检查。
+	// pad is the padding byte read for an odd payload length; the spec requires
+	// zero and strict parsing checks it.
+	pad byte
 }
 
 // validFourCC reports whether every byte of the code is printable ASCII.
@@ -111,13 +115,15 @@ func readRiffChunk(r io.Reader) (*riffChunk, error) {
 	if size == 0 {
 		data = []byte{}
 	}
+	var pad byte
 	if size&1 == 1 {
-		var pad [1]byte
-		if _, err := io.ReadFull(r, pad[:]); err != nil {
+		var p [1]byte
+		if _, err := io.ReadFull(r, p[:]); err != nil {
 			return nil, errors.WithMessagef(err, "invalid webp: can not read chunk %q padding", string(name))
 		}
+		pad = p[0]
 	}
-	return &riffChunk{name: name, data: data}, nil
+	return &riffChunk{name: name, data: data, pad: pad}, nil
 }
 
 // chunkSize returns the number of bytes a chunk occupies in the stream,

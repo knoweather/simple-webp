@@ -107,6 +107,29 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// ParseOptions 调节容器解析。零值等价于 ParseWebp 的宽松行为。
+//
+// ParseOptions tunes container parsing. The zero value matches the lenient
+// behaviour of ParseWebp.
+type ParseOptions struct {
+	// Strict 打开规范 MUST 校验：VP8X 必须第一个、重建类 chunk 顺序、
+	// VP8X 保留位为 0、动画位必须有 ANIM、帧矩形落在画布内、VP8L 帧不得带
+	// ALPH、填充字节为 0。默认关闭，以免拒绝真实世界里的脏文件。
+	//
+	// Strict enables the spec MUST checks: VP8X first, the order of the
+	// reconstructing chunks, zeroed VP8X reserved bits, an ANIM chunk behind
+	// the animation flag, frames inside the canvas, no ALPH on a VP8L frame,
+	// and zero padding bytes. It is off by default so real world files that
+	// violate these rules still parse.
+	Strict bool
+	// VerifySize 要求 RIFF File Size 与实际流长度一致，也就是 ParseWebp 的
+	// verifySize 参数。
+	//
+	// VerifySize requires the RIFF File Size to match the actual stream length,
+	// the verifySize argument of ParseWebp.
+	VerifySize bool
+}
+
 // ParseWebp 解析 WebP 流：读取 RIFF 头与全部 chunk，并解码容器级 chunk
 // （VP8X、VP8、VP8L、ALPH、ANIM、ANMF、ICCP、EXIF、XMP）。未知类型的 chunk
 // 以原始形式保留，见 RawChunks。仅当 verifySize 为 true 时才校验 RIFF
@@ -118,6 +141,13 @@ func (c *countingReader) Read(p []byte) (int, error) {
 //
 // The RIFF size field is validated only when verifySize is true.
 func ParseWebp(r io.Reader, verifySize ...bool) (*Webp, error) {
+	return ParseWebpWith(r, ParseOptions{VerifySize: len(verifySize) > 0 && verifySize[0]})
+}
+
+// ParseWebpWith 按给定选项解析 WebP 流，见 ParseOptions。
+//
+// ParseWebpWith parses a webp stream with the given options, see ParseOptions.
+func ParseWebpWith(r io.Reader, opt ParseOptions) (*Webp, error) {
 	cr := &countingReader{r: r}
 	var head [12]byte
 	if _, err := io.ReadFull(cr, head[:]); err != nil {
@@ -155,7 +185,7 @@ func ParseWebp(r io.Reader, verifySize ...bool) (*Webp, error) {
 	if len(w.chunks) == 0 {
 		return nil, errors.New("invalid webp: no chunks")
 	}
-	if len(verifySize) > 0 && verifySize[0] {
+	if opt.VerifySize {
 		// The limited read only counted up to the declared size, so drain the
 		// trailing bytes before comparing the counters.
 		// 限定读取只统计到声明长度，所以先把尾部数据读掉再比对计数。
@@ -175,6 +205,11 @@ func ParseWebp(r io.Reader, verifySize ...bool) (*Webp, error) {
 	if err := w.parseBaseChunk(); err != nil {
 		return nil, errors.WithStack(err)
 	}
+	if opt.Strict {
+		if err := w.validateStrict(); err != nil {
+			return nil, err
+		}
+	}
 	return w, nil
 }
 
@@ -185,6 +220,14 @@ func ParseWebp(r io.Reader, verifySize ...bool) (*Webp, error) {
 // not verified (ParseWebp is called without verifySize).
 func ParseWebpBytes(b []byte) (*Webp, error) {
 	return ParseWebp(bytes.NewReader(b))
+}
+
+// ParseWebpBytesWith 按给定选项解析内存中的 WebP 字节流，见 ParseOptions。
+//
+// ParseWebpBytesWith parses a webp stream held in memory with the given
+// options, see ParseOptions.
+func ParseWebpBytesWith(b []byte, opt ParseOptions) (*Webp, error) {
+	return ParseWebpWith(bytes.NewReader(b), opt)
 }
 
 // parseBaseChunk 消费所有本库能识别的 chunk，并根据解析结果推导
