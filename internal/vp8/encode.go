@@ -45,6 +45,14 @@ type encoder struct {
 	// predY4 holds the sixteen chosen 4x4 luma modes.
 	predY4 [4][4]uint8
 	qi     int
+	// filterLevel、sharpness 与 simpleFilter 决定帧头里的环路滤波参数；强度为
+	// 0 时解码端完全跳过滤波。
+	//
+	// filterLevel, sharpness and simpleFilter pick the loop filter parameters in
+	// the frame header; a zero level lets the decoder skip filtering entirely.
+	filterLevel  int
+	sharpness    int
+	simpleFilter bool
 	// y4Blocks 统计走了 4x4 模式那条路的宏块数，供测试确认这条路真的被走到。
 	//
 	// y4Blocks counts the macroblocks that took the 4x4 mode path, so the tests
@@ -123,6 +131,56 @@ const (
 // Encode codes a 4:2:0 YCbCr image as a VP8 key frame. quality runs from 0
 // (smallest) to 100 (best).
 func Encode(src *image.YCbCr, quality int) ([]byte, error) {
+	return EncodeWithOptions(src, Options{Quality: quality, FilterLevel: -1})
+}
+
+// Options 调节 VP8 编码器。
+//
+// Options tunes the VP8 encoder.
+type Options struct {
+	// Quality 取 0（体积最小）到 100（质量最高）。
+	//
+	// Quality runs from 0 (smallest) to 100 (best).
+	Quality int
+	// FilterLevel 是环路滤波强度 0..63。0 关闭滤波，-1 按质量自动选择；强度
+	// 越大块效应越弱，但同质量下细节也更软。
+	//
+	// FilterLevel is the loop filter strength, 0..63. Zero disables the filter,
+	// -1 derives the strength from the quality; a stronger filter removes more
+	// blocking at the cost of softer detail.
+	FilterLevel int
+	// SimpleFilter 为 true 时用简单滤波（只处理亮度边缘），否则用普通滤波。
+	//
+	// SimpleFilter selects the simple filter (luma edges only) instead of the
+	// normal one.
+	SimpleFilter bool
+	// Sharpness 是滤波锐度 0..7，越大越保留细节。
+	//
+	// Sharpness is the filter sharpness, 0..7, where a larger value keeps more
+	// detail.
+	Sharpness int
+}
+
+// autoFilterLevel 由质量推导环路滤波强度：质量越低，量化越粗、块效应越强，
+// 需要的滤波也越强。
+//
+// autoFilterLevel derives the loop filter strength from the quality: a lower
+// quality means coarser quantization, stronger blocking and a stronger filter.
+func autoFilterLevel(quality int) int {
+	if quality < 0 {
+		quality = 0
+	}
+	if quality > 100 {
+		quality = 100
+	}
+	return (100 - quality) * 63 / 100
+}
+
+// EncodeWithOptions 按给定选项把 4:2:0 的 YCbCr 图象编码为一帧 VP8 码流。
+//
+// EncodeWithOptions encodes a 4:2:0 YCbCr image as one VP8 frame with the given
+// options.
+func EncodeWithOptions(src *image.YCbCr, opt Options) ([]byte, error) {
 	if src.SubsampleRatio != image.YCbCrSubsampleRatio420 {
 		return nil, ErrInvalid
 	}
@@ -130,8 +188,70 @@ func Encode(src *image.YCbCr, quality int) ([]byte, error) {
 	if w <= 0 || h <= 0 || w > 16383 || h > 16383 {
 		return nil, ErrInvalid
 	}
-	e := newEncoder(w, h, src, quality)
+	e := newEncoder(w, h, src, opt.Quality)
+	level := opt.FilterLevel
+	if level < 0 {
+		level = autoFilterLevel(opt.Quality)
+	}
+	if level > 63 {
+		level = 63
+	}
+	e.filterLevel = level
+	e.simpleFilter = opt.SimpleFilter
+	e.sharpness = clipInt(opt.Sharpness, 0, 7)
 	return e.run(), nil
+}
+
+// EncodeToTarget 在给定选项的基础上做码率控制：在质量 0..100 之间二分，返回
+// 体积最接近 targetBytes 的那一次编码结果。码率控制只调全局量化，逐段量化
+// 尚未实现；目标无法精确命中时返回最接近的一次。
+//
+// EncodeToTarget adds rate control on top of the given options: it bisects the
+// quality over 0..100 and returns the encode whose size is closest to
+// targetBytes. Only the global quantiser is adjusted (per-segment quantization is
+// not implemented); when the target cannot be hit exactly the closest encode is
+// returned.
+func EncodeToTarget(src *image.YCbCr, opt Options, targetBytes int) ([]byte, error) {
+	if targetBytes <= 0 {
+		return nil, ErrInvalid
+	}
+	bestErr := int(^uint(0) >> 1)
+	var bestData []byte
+	lo, hi := 0, 100
+	for i := 0; i < 8 && lo <= hi; i++ {
+		q := (lo + hi) / 2
+		o := opt
+		o.Quality = q
+		data, err := EncodeWithOptions(src, o)
+		if err != nil {
+			return nil, err
+		}
+		if diff := absDiff(len(data), targetBytes); diff < bestErr {
+			bestErr = diff
+			bestData = data
+		}
+		if len(data) > targetBytes {
+			hi = q - 1
+		} else {
+			lo = q + 1
+		}
+	}
+	if bestData == nil {
+		return nil, ErrInvalid
+	}
+	return bestData, nil
+}
+
+// absDiff 返回两个整数之差的绝对值，供码率控制比较体积偏差。
+//
+// absDiff returns the absolute difference of two integers, used by the rate
+// control to compare size deviations.
+func absDiff(a, b int) int {
+	if d := a - b; d < 0 {
+		return -d
+	} else {
+		return d
+	}
 }
 
 // quantIndex 把质量映射到量化索引：质量越高索引越小。
@@ -387,11 +507,15 @@ func (e *encoder) writeHeader() {
 	// 不使用分段。
 	// no segmentation.
 	h.putBit(uniformProb, false)
-	// 滤波：类型简单、强度 0、锐度 0、不做参考帧/模式偏移。
-	// filtering: simple type, level 0, sharpness 0, no reference or mode deltas.
-	h.putBit(uniformProb, false)
-	h.putUint(uniformProb, 6, 0)
-	h.putUint(uniformProb, 3, 0)
+	// 滤波：类型、强度、锐度、不做参考帧/模式偏移。
+	// filtering: type, level, sharpness, no reference or mode deltas.
+	if e.filterLevel > 0 && !e.simpleFilter {
+		h.putBit(uniformProb, false) // 普通滤波 / normal filter
+	} else {
+		h.putBit(uniformProb, e.filterLevel > 0) // 简单滤波 / simple filter
+	}
+	h.putUint(uniformProb, 6, uint32(e.filterLevel))
+	h.putUint(uniformProb, 3, uint32(e.sharpness))
 	h.putBit(uniformProb, false)
 	// 单个残差分区。
 	// a single residual partition.

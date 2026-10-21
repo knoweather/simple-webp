@@ -57,6 +57,24 @@ type LossyOptions struct {
 	// AlphaUncompressed stores the alpha plane verbatim (C=0); by default it is
 	// compressed losslessly with VP8L (C=1). Neither mode quantises the alpha.
 	AlphaUncompressed bool
+	// FilterLevel 是 VP8 环路滤波强度 1..63；0（默认）按质量自动选择，
+	// -1 关闭滤波。强度越大块效应越弱，细节也更软。
+	//
+	// FilterLevel is the VP8 loop filter strength, 1..63. Zero (the default)
+	// derives it from the quality, -1 disables the filter. A stronger filter
+	// removes more blocking and softens detail.
+	FilterLevel int
+	// SimpleFilter 为 true 时用简单滤波（只处理亮度边缘），否则用普通滤波。
+	//
+	// SimpleFilter selects the simple filter (luma edges only).
+	SimpleFilter bool
+	// TargetBytes 打开码率控制：在质量 0..100 之间二分，取最接近该体积的编码
+	// 结果（只对 VP8 码流生效，alpha 与元数据不计入）。0 表示按 Quality 编码。
+	//
+	// TargetBytes enables rate control: the quality is bisected over 0..100 and the
+	// encode closest to that size wins (it covers the VP8 bitstream only, alpha
+	// and metadata are not counted). 0 encodes at Quality.
+	TargetBytes int
 }
 
 // defaultLossyQuality 是未指定质量时使用的取值。
@@ -104,6 +122,8 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 	var iccp, exif, xmp []byte
 	var alphaFilter uint8
 	var alphaUncompressed bool
+	filterLevel := -1
+	var simpleFilter bool
 	if opt != nil {
 		if opt.QualityZero {
 			quality = opt.Quality
@@ -113,6 +133,11 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 		iccp, exif, xmp = opt.ICCP, opt.EXIF, opt.XMP
 		alphaFilter = opt.AlphaFilter
 		alphaUncompressed = opt.AlphaUncompressed
+		simpleFilter = opt.SimpleFilter
+		filterLevel = opt.FilterLevel
+		if filterLevel == 0 {
+			filterLevel = -1 // 0 表示自动 / zero means automatic
+		}
 	}
 	if quality < 0 || quality > 100 {
 		return nil, errors.Errorf("webp: quality %d out of range 0..100", quality)
@@ -120,9 +145,30 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 	if alphaFilter > ALPHFilterGradient {
 		return nil, errors.Errorf("webp: unsupported alpha filter %d", alphaFilter)
 	}
+	if filterLevel < -1 || filterLevel > 63 {
+		return nil, errors.Errorf("webp: filter level %d out of range -1..63", filterLevel)
+	}
+	if opt != nil && opt.TargetBytes < 0 {
+		return nil, errors.Errorf("webp: target size %d must not be negative", opt.TargetBytes)
+	}
 
 	ycc := imageToYCbCr420(m)
-	payload, err := vp8.Encode(ycc, quality)
+	vp8Opt := vp8.Options{
+		Quality:      quality,
+		FilterLevel:  filterLevel,
+		SimpleFilter: simpleFilter,
+	}
+	var targetBytes int
+	if opt != nil {
+		targetBytes = opt.TargetBytes
+	}
+	var payload []byte
+	var err error
+	if targetBytes > 0 {
+		payload, err = vp8.EncodeToTarget(ycc, vp8Opt, targetBytes)
+	} else {
+		payload, err = vp8.EncodeWithOptions(ycc, vp8Opt)
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "webp: vp8 encode")
 	}
