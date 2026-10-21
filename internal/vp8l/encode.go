@@ -5,10 +5,9 @@ import (
 	"math/bits"
 )
 
-// Options 是 EncodeARGB 的压缩策略选项，目前只有 Method 一个字段。
+// Options 是 EncodeARGB 的压缩策略选项。
 //
-// Options carries the compression strategy of EncodeARGB; it currently has a
-// single field, Method.
+// Options carries the compression strategy of EncodeARGB.
 type Options struct {
 	// Method 以速度换压缩率：0 只存储字面量，1（默认）追加减绿变换、颜色
 	// 索引与 LZ77，2 再启用预测变换。
@@ -16,6 +15,13 @@ type Options struct {
 	// adds the subtract green transform, colour indexing and LZ77, and 2
 	// also applies a predictor transform.
 	Method int
+	// DisableColorCache 关闭颜色缓存。默认在 Method >= 2 时按颜色重复率自动
+	// 选择 cache_bits；只有重复色较多的图像才真正启用。
+	//
+	// DisableColorCache turns the colour cache off. By default Method >= 2 picks
+	// cache_bits automatically from the colour repetition of the image, and the
+	// cache is only switched on when enough colours repeat.
+	DisableColorCache bool
 }
 
 // 编码器调参：单个后向引用与搜索窗口的像素上限、哈希表位数、哈希链探测
@@ -55,11 +61,13 @@ func EncodeARGB(pix []uint32, width, height int, opt *Options) ([]byte, error) {
 		return nil, ErrTooLarge
 	}
 	method := 1
+	colorCache := false
 	if opt != nil {
 		method = opt.Method
+		colorCache = !opt.DisableColorCache
 	}
-
 	e := &encoder{}
+	e.useColorCache = method >= 1 && colorCache
 	e.w.writeBits(0x2f, 8)
 	e.w.writeBits(uint32(width-1), 14)
 	e.w.writeBits(uint32(height-1), 14)
@@ -293,40 +301,186 @@ func predictorAt(pix []uint32, width, height, x, y, mode int) uint32 {
 	return predict(mode, left, top, topLeft, topRight)
 }
 
-// writeEntropyImage 写出一张熵编码图像：颜色缓存标志（本编码器恒不使用）、
-// 五组前缀码（绿、红、蓝、码长、距离）以及 LZ77 切分后的像素流。level0 为
-// 真时（流的最外层图像）再写一位，声明不使用元前缀图像。
+// vp8lEvent 是熵编码像素流中的一步：字面量、颜色缓存引用或后向引用。
 //
-// writeEntropyImage writes one entropy coded image: the colour cache flag
-// (never used by this encoder), the five prefix codes (green, red, blue, code
-// length and distance) and the LZ77 coded pixels. When level0 is true (the
-// outermost image of the stream) it also writes the bit that disables the meta
-// prefix image.
+// vp8lEvent is one step of the entropy coded pixel stream: a literal, a colour
+// cache reference or a backward reference.
+type vp8lEvent struct {
+	kind   int
+	pixel  uint32
+	index  int
+	length int
+	dist   int
+}
+
+// 事件类型 / event kinds.
+const (
+	evLiteral = iota
+	evCacheRef
+	evCopy
+)
+
+// chooseCacheBits 按颜色重复率挑选 cache_bits：只在命中率足够高时才启用，
+// 否则返回 0。命中率的统计方式与真正写出时的缓存维护完全一致。
+//
+// chooseCacheBits picks cache_bits from the colour repetition: the cache is only
+// used when enough lookups hit, otherwise it returns 0. The hit rate is counted
+// exactly the way the cache is maintained while the tokens are written.
+func chooseCacheBits(pix []uint32, tokens []token) int {
+	const bits = 8
+	if len(pix) < 512 {
+		return 0
+	}
+	shift := uint(32 - bits)
+	cache := make([]uint32, 1<<bits)
+	hits, seen, pos := 0, 0, 0
+	for _, t := range tokens {
+		if t.length == 0 {
+			p := t.literal
+			h := (0x1e35a7bd * p) >> shift
+			if cache[h] == p {
+				hits++
+			}
+			cache[h] = p
+			seen++
+			pos++
+			continue
+		}
+		for i := 0; i < t.length; i++ {
+			p := pix[pos+i]
+			cache[(0x1e35a7bd*p)>>shift] = p
+		}
+		pos += t.length
+		seen += t.length
+	}
+	if seen == 0 || hits*10 < seen {
+		return 0
+	}
+	return bits
+}
+
+// buildEvents 把 LZ77 的 token 序列翻译成写比特时的事件序列，并在过程中维护
+// 与解码端完全一致的颜色缓存：字面量与后向引用覆盖的像素都入缓存，缓存引用
+// 本身不再入缓存。
+//
+// buildEvents turns the LZ77 token sequence into the event sequence written to
+// the bitstream and maintains the colour cache exactly like the decoder: literal
+// pixels and every pixel covered by a backward reference are inserted, while a
+// cache reference inserts nothing.
+func buildEvents(pix []uint32, tokens []token, cacheBits int) []vp8lEvent {
+	events := make([]vp8lEvent, 0, len(tokens))
+	var cache []uint32
+	var shift uint
+	if cacheBits > 0 {
+		cache = make([]uint32, 1<<cacheBits)
+		shift = uint(32 - cacheBits)
+	}
+	pos := 0
+	for _, t := range tokens {
+		if t.length == 0 {
+			p := t.literal
+			if cache != nil {
+				h := (0x1e35a7bd * p) >> shift
+				if cache[h] == p {
+					events = append(events, vp8lEvent{kind: evCacheRef, index: int(h)})
+					pos++
+					continue
+				}
+				cache[h] = p
+			}
+			events = append(events, vp8lEvent{kind: evLiteral, pixel: p})
+			pos++
+			continue
+		}
+		events = append(events, vp8lEvent{kind: evCopy, length: t.length, dist: t.dist})
+		if cache != nil {
+			for i := 0; i < t.length; i++ {
+				p := pix[pos+i]
+				cache[(0x1e35a7bd*p)>>shift] = p
+			}
+		}
+		pos += t.length
+	}
+	return events
+}
+
+// writeEntropyImage 写出一张熵编码图像：颜色缓存标志、五组前缀码（绿、红、
+// 蓝、码长、距离）以及 LZ77 切分后的像素流。level0 为真时（流的最外层图像）
+// 再写一位，声明不使用元前缀图像；颜色缓存只在外层图像上启用。
+//
+// writeEntropyImage writes one entropy coded image: the colour cache flags, the
+// five prefix codes (green, red, blue, code length and distance) and the LZ77
+// coded pixels. When level0 is true (the outermost image of the stream) it also
+// writes the bit that disables the meta prefix image; the colour cache is used
+// on the outermost image only.
 func (e *encoder) writeEntropyImage(pix []uint32, width, height int, level0 bool) {
-	e.w.writeBits(0, 1) // 不使用颜色缓存 / no colour cache
+	tokens := lz77(pix)
+	cacheBits := 0
+	if level0 && e.useColorCache {
+		cacheBits = chooseCacheBits(pix, tokens)
+	}
+	if cacheBits == 0 {
+		e.writeEntropySection(pix, tokens, 0, level0)
+		return
+	}
+
+	// 颜色缓存会放大绿色字母表，收益取决于内容：两种写法各试一次，留下比特
+	// 更少的那个，保证不会因为缓存反而变大。
+	// The colour cache widens the green alphabet, so the gain depends on the
+	// content: write both versions and keep the shorter one, which guarantees the
+	// cache never makes the stream larger.
+	mark := e.w.mark()
+	e.writeEntropySection(pix, tokens, cacheBits, level0)
+	withCache := e.w.mark()
+	e.w.restore(mark)
+	e.writeEntropySection(pix, tokens, 0, level0)
+	if withCache.pos() < e.w.bitPos() {
+		e.w.restore(mark)
+		e.writeEntropySection(pix, tokens, cacheBits, level0)
+	}
+}
+
+// writeEntropySection 写出一段熵编码图像：颜色缓存标志、五组前缀码与事件流。
+//
+// writeEntropySection writes one entropy coded image section: the colour cache
+// flags, the five prefix codes and the event stream.
+func (e *encoder) writeEntropySection(pix []uint32, tokens []token, cacheBits int, level0 bool) {
+	if cacheBits > 0 {
+		e.w.writeBits(1, 1)
+		e.w.writeBits(uint32(cacheBits), 4)
+	} else {
+		e.w.writeBits(0, 1) // 不使用颜色缓存 / no colour cache
+	}
 	if level0 {
 		e.w.writeBits(0, 1) // 不使用元前缀图像 / no meta prefix image
 	}
 
-	tokens := lz77(pix)
+	events := buildEvents(pix, tokens, cacheBits)
+	greenAlphabet := 256 + 24
+	if cacheBits > 0 {
+		greenAlphabet += 1 << cacheBits
+	}
 	var freq [5][]uint32
-	freq[0] = make([]uint32, 256+24)
+	freq[0] = make([]uint32, greenAlphabet)
 	freq[1] = make([]uint32, 256)
 	freq[2] = make([]uint32, 256)
 	freq[3] = make([]uint32, 256)
 	freq[4] = make([]uint32, 40)
-	for _, t := range tokens {
-		if t.length == 0 {
-			freq[0][t.literal>>8&0xff]++
-			freq[1][t.literal>>16&0xff]++
-			freq[2][t.literal&0xff]++
-			freq[3][t.literal>>24&0xff]++
-			continue
+	for _, ev := range events {
+		switch ev.kind {
+		case evLiteral:
+			freq[0][ev.pixel>>8&0xff]++
+			freq[1][ev.pixel>>16&0xff]++
+			freq[2][ev.pixel&0xff]++
+			freq[3][ev.pixel>>24&0xff]++
+		case evCacheRef:
+			freq[0][256+24+ev.index]++
+		case evCopy:
+			prefix, _, _ := encodePrefix(ev.length)
+			freq[0][256+prefix]++
+			dprefix, _, _ := encodePrefix(ev.dist + 120)
+			freq[4][dprefix]++
 		}
-		prefix, _, _ := encodePrefix(t.length)
-		freq[0][256+prefix]++
-		dprefix, _, _ := encodePrefix(t.dist + 120)
-		freq[4][dprefix]++
 	}
 
 	var trees [5]huffmanCode
@@ -335,20 +489,23 @@ func (e *encoder) writeEntropyImage(pix []uint32, width, height int, level0 bool
 		e.writeHuffmanCode(trees[i])
 	}
 
-	for _, t := range tokens {
-		if t.length == 0 {
-			e.writeSymbol(trees[0], t.literal>>8&0xff)
-			e.writeSymbol(trees[1], t.literal>>16&0xff)
-			e.writeSymbol(trees[2], t.literal&0xff)
-			e.writeSymbol(trees[3], t.literal>>24&0xff)
-			continue
+	for _, ev := range events {
+		switch ev.kind {
+		case evLiteral:
+			e.writeSymbol(trees[0], ev.pixel>>8&0xff)
+			e.writeSymbol(trees[1], ev.pixel>>16&0xff)
+			e.writeSymbol(trees[2], ev.pixel&0xff)
+			e.writeSymbol(trees[3], ev.pixel>>24&0xff)
+		case evCacheRef:
+			e.writeSymbol(trees[0], uint32(256+24+ev.index))
+		case evCopy:
+			prefix, extra, n := encodePrefix(ev.length)
+			e.writeSymbol(trees[0], 256+prefix)
+			e.w.writeBits(extra, n)
+			dprefix, dextra, dn := encodePrefix(ev.dist + 120)
+			e.writeSymbol(trees[4], dprefix)
+			e.w.writeBits(dextra, dn)
 		}
-		prefix, extra, n := encodePrefix(t.length)
-		e.writeSymbol(trees[0], 256+prefix)
-		e.w.writeBits(extra, n)
-		dprefix, dextra, dn := encodePrefix(t.dist + 120)
-		e.writeSymbol(trees[4], dprefix)
-		e.w.writeBits(dextra, dn)
 	}
 }
 
@@ -808,6 +965,10 @@ Bit writer / 比特写入器
 // encoder collects the output bits produced during encoding.
 type encoder struct {
 	w bitWriter
+	// useColorCache 决定最外层图像是否按颜色重复率启用颜色缓存。
+	// useColorCache decides whether the outermost image uses the colour cache
+	// when the colours repeat enough.
+	useColorCache bool
 }
 
 // bitWriter 按 VP8L 的要求以最低有效位优先写比特。
@@ -854,6 +1015,34 @@ func (w *bitWriter) writeCode(code uint32, n uint32) {
 // bits that do not yet fill a byte.
 func (w *bitWriter) bitPos() int {
 	return len(w.buf)*8 + int(w.n)
+}
+
+// writerState 保存 bitWriter 的状态，让编码器可以试写一段再回退。
+//
+// writerState saves the state of a bitWriter so the encoder can try a section and
+// roll it back.
+type writerState struct {
+	bufLen int
+	bits   uint64
+	n      uint
+}
+
+// pos 返回该状态对应的比特位置。
+//
+// pos returns the bit position of the state.
+func (s writerState) pos() int { return s.bufLen*8 + int(s.n) }
+
+// mark 记录当前写入位置。/ mark records the current write position.
+func (w *bitWriter) mark() writerState {
+	return writerState{bufLen: len(w.buf), bits: w.bits, n: w.n}
+}
+
+// restore 回退到 mark 记录的位置，之后写入的内容覆盖旧数据。
+// restore returns to a mark; later writes overwrite the discarded bits.
+func (w *bitWriter) restore(s writerState) {
+	w.buf = w.buf[:s.bufLen]
+	w.bits = s.bits
+	w.n = s.n
 }
 
 // finish 把末尾不足一个字节的余位补零成整字节，并返回输出缓冲区。
