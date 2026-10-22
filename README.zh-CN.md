@@ -17,7 +17,7 @@ chunk 化、原始字节保留、可字节级回写。
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | RIFF/WEBP 容器 | ✅ | `VP8 `/`VP8L`/`VP8X`/`ALPH`/`ANIM`/`ANMF`/`ICCP`/`EXIF`/`XMP `，含 padding |
-| 严格解析 | ✅ | `ParseOptions.Strict` 校验规范 MUST（chunk 顺序、VP8X 必须最前、保留位、画布面积、帧矩形、VP8L 不带 ALPH、填充字节为 0）；默认仍宽松 |
+| 严格解析 | ✅ | `ParseOptions.Strict` 校验规范 MUST（chunk 顺序、VP8X 必须最前、VP8X/ALPH/ANMF 保留位、画布面积、帧矩形、只能有一个图像数据块、VP8X 标志与实际数据一致、VP8L 不带 ALPH、填充字节为 0）；默认仍宽松 |
 | VP8L 无损解码 | ✅ | 4 种变换（predictor/color/subtract-green/color-indexing）、meta-Huffman、LZ77、color cache |
 | VP8 有损解码 | ✅ | bool 解码器、关键帧头、分区、系数树、16x16/8x8/4x4 预测、WHT+IDCT、loop filter |
 | ALPH 透明通道 | ✅ | 未压缩（3 种行滤波）与 VP8L 压缩两种 alpha |
@@ -106,7 +106,12 @@ w, err := simple_webp.ParseWebpWith(r, simple_webp.ParseOptions{Strict: true, Ve
 ```
 
 `Strict` 打开规范 MUST 校验，发现第一条违规就报错；默认（以及 `ParseWebp`）保持宽松，
-真实世界里不合规的文件仍能解析。
+真实世界里不合规的文件仍能解析。校验覆盖重建类 chunk 的顺序、`VP8X`/`ALPH`/`ANMF`
+的保留位、画布面积、帧矩形、「只能有一个图像数据块」以及 `VP8X` 特性标志与文件里
+实际数据是否一致。
+
+有两类情况刻意**不**报错，因为规范允许它们：元数据与未知 chunk 的顺序是自由的；
+没有置动画标志时，`ANIM` chunk 应当被忽略，而不是判为非法。
 
 ### 解码成 YCbCr
 
@@ -277,7 +282,8 @@ Windows / amd64，`go test -run XXX -bench . -benchtime 200ms`，本系列容器
   正变换与量化，再按「重建失真 + 系数 token 的比特数」打分取最优。亮度用整块
   16×16 或十六个 4×4 模式（取更便宜的一条），色度用 8×8 模式。环路滤波与目标体积
   码率控制都已实现，但码率控制只调全局量化，逐段量化还没做，所以同质量下的体积
-  仍随内容波动。
+  仍随内容波动。质量→量化曲线本身已经对齐 libwebp，同一个 `Quality` 选出的
+  量化步长与对应的 `cwebp -q` 基本一致。
 - 有损编码跑两遍：第一遍收集 token 统计，第二遍用据此调整的概率表编码，耗时约为
   单遍的 1.8 倍。模式搜索只在第一遍做，第二遍直接沿用第一遍选好的模式。
 - 率失真搜索是编码变慢的主因：每个宏块的每个 4×4 块都要把十种模式各跑一遍
@@ -296,14 +302,33 @@ Windows / amd64，`go test -run XXX -bench . -benchtime 200ms`，本系列容器
 
 ## 演进方向
 
-有损编码器按设计只做帧内。率失真模式决策、4×4 帧内模式、环路滤波与全局码率控制
-都已完成，与 `cwebp` 之间的剩余差距在：
+有损编码器按设计只做帧内，而码流本身是合规的：VP8 与 VP8L 编码器写出的码流，
+用独立解码器（`golang.org/x/image`，libwebp 的 Go 移植版）能解出逐样本一致的结果。
+与 `cwebp` 之间的剩余差距按下表排列，按「改动量 ÷ 收益」排序：
 
-- **逐段量化**：整帧仍是同一个量化索引，复杂区域与平坦区域共用同一步长。帧头已经
-  支持逐段增量，下一步是按宏块活动度分配。
-- **更多码组与更好的聚类**：meta 前缀码目前只分两组，libwebp 会聚成更多组，也更擅长
-  「照片 + 文字」这类混合内容。
-- **多 token 分区**：目前只有一个残差分区，影响解码并行度而不影响体积。
+质量→量化曲线已经对齐 libwebp（分段线性再开立方根），所以同一个 `Quality`
+大致对应 `cwebp -q` 相同的量化步长。在一张 320×240 的平滑测试图上，同一个质量
+设置现在比原来的线性映射多约 1.5–3.7 dB PSNR；两条曲线在质量 100 处重合。
+
+| # | 项目 | 现状 | 计划 |
+|---|---|---|---|
+| 1 | **token 概率更新的成本模型** | `adaptTokenProb` 用统一的 12 bit 收益阈值，没查 `tokenUpdateProb`。表里约 40% 的条目更新概率是 255，RFC 6386 §13.5 规定这类条目「从不更新」；给它们写更新标志实际要 ~16 bit，而模型按 ~9 bit 算，可能反而把码流写大 | 按条目实际信号成本定价，对齐 libwebp 的 `enc/frame_enc.c` |
+| 2 | **首分区长度溢出** | 帧头里的首分区长度是 19 位字段，既不掩码也不检查范围，超大画布下会静默损坏码流 | 放不下时返回错误，对齐 libwebp 的 `VP8_ENC_ERROR_PARTITION0_OVERFLOW` |
+| 3 | **`LossyOptions.Sharpness`** | `internal/vp8` 已按 RFC 正确写入 3 位 `sharpness_level`，但 `LossyOptions` 没有这个字段，外部根本传不进来 | 给 `LossyOptions` 补上该字段（注释方向也要改：和 `cwebp -sharpness` 一样，0 最锐） |
+| 4 | **动图编码忽略 `AlphaFilter`** | 静态有损路径按 `LossyOptions.AlphaFilter` 选滤波，动图路径却硬编码成 `ALPHFilterNone` | 动图路径也读 `LossyOpt.AlphaFilter` |
+| 5 | **动图 `Duration` 溢出** | 24 bit 字段静默截断（`1<<24` 写成 0，负数回绕） | 编码前校验范围并返回错误 |
+| 6 | **VP8L 颜色索引的 alpha** | 规范要求索引图所有 alpha 置 255，编码端写成 0；解码不受影响（逆变换整体替换像素） | 按规范写 255 |
+| 7 | **VP8L 重复变换** | 规范要求每种变换只能用一次，解码端没有去重，libwebp 判为损坏 | 解码时拒绝重复的变换类型 |
+| 8 | **VP8L 二维邻域距离码** | 解码端实现了完整的 120 项邻域映射，编码端却一律写线性距离码：1 像素距离要 ~10 bit，邻域码只要 1 bit。这是无损体积差距最大的单一来源 | 编码端补上 `DistanceToPlaneCode` 与查找表，对齐 libwebp 的 `src/enc/vp8l_enc.c` |
+| 9 | **逐段量化** | 整帧仍是同一个量化索引，复杂区域与平坦区域共用同一步长。解码端已支持逐段量化与逐段滤波强度，只差编码端 | 按宏块活动度分配量化索引，对齐 `cwebp -segments` |
+| 10 | **更多码组与更好的聚类** | meta 前缀码目前只分两组，libwebp 会聚成更多组，也更擅长「照片 + 文字」这类混合内容 | 聚成更多组 |
+| 11 | **动图帧间差分** | 每帧都是全量编码：没有帧矩形裁剪，也没有帧间差分 | 加差分与最小化，对齐 libwebp 的 `WebPAnimEncoder` |
+| 12 | **多 token 分区** | 目前只有一个残差分区，影响解码并行度而不影响体积 | 写出多个分区 |
+
+另有几项 libwebp 私有能力不在 WebP 码流里，规范并没有要求：`-near_lossless` 源端
+预滤波、`-alpha_q` 有损 alpha、`-sns` 空间噪声整形、`-pass` 多遍优化、
+`-partition_limit`、`-mt` 多线程。本库也还没有增量/流式解码 API
+（libwebp 的 `WebPIDecoder`）。
 
 ## 安全 / 像素预算
 

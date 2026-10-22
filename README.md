@@ -20,7 +20,7 @@ preserved, byte-exact write back.
 | Capability | Status | Notes |
 |---|---|---|
 | RIFF/WEBP container | ✅ | `VP8 `/`VP8L`/`VP8X`/`ALPH`/`ANIM`/`ANMF`/`ICCP`/`EXIF`/`XMP `, incl. padding |
-| Strict parsing | ✅ | `ParseOptions.Strict` checks the spec MUST rules (chunk order, VP8X first, reserved bits, canvas area, frame inside canvas, no ALPH on VP8L, zero padding); the default stays lenient |
+| Strict parsing | ✅ | `ParseOptions.Strict` checks the spec MUST rules (chunk order, VP8X first, VP8X/ALPH/ANMF reserved bits, canvas area, frame inside canvas, exactly one image chunk, VP8X flags matching the data, no ALPH on VP8L, zero padding); the default stays lenient |
 | VP8L lossless decode | ✅ | 4 transforms (predictor/color/subtract-green/color-indexing), meta-Huffman, LZ77, color cache |
 | VP8 lossy decode | ✅ | bool decoder, keyframe header, partitions, coefficient trees, 16x16/8x8/4x4 prediction, WHT+IDCT, loop filter |
 | ALPH transparency | ✅ | uncompressed (3 row filters) and VP8L-compressed alpha |
@@ -98,7 +98,14 @@ w, err := simple_webp.ParseWebpWith(r, simple_webp.ParseOptions{Strict: true, Ve
 
 `Strict` enables the spec MUST checks and reports the first violation; the
 default (and `ParseWebp`) stays lenient so real world files that break the rules
-still parse.
+still parse. The checks cover the order of the reconstructing chunks, the
+reserved bits of `VP8X`, `ALPH` and `ANMF`, the canvas area, the frame
+rectangles, the "exactly one image chunk" rule and the agreement between the
+`VP8X` feature flags and the data in the file.
+
+Two things are deliberately *not* rejected, because the spec allows them:
+metadata and unknown chunks may appear out of order, and an `ANIM` chunk
+without the animation flag must be ignored rather than treated as an error.
 
 ### Decode to YCbCr
 
@@ -292,7 +299,9 @@ smaller; the size ratio against `cwebp` was not re-measured here.
   one 16x16 mode or sixteen 4x4 modes, whichever is cheaper and the chroma uses
   8x8 modes. The loop filter and a target-size rate control are in; the rate
   control moves the global quantiser only, per-segment quantization is still
-  open, so the size at a given quality still depends on the content
+  open, so the size at a given quality still depends on the content. The
+  quality to quantiser curve itself follows libwebp's, so a given `Quality`
+  selects about the same step as the matching `cwebp -q`
 - Lossy encoding runs twice: the first pass collects token statistics and the
   second encodes with probabilities adapted to them, which costs about 1.8x the
   time of a single pass. The mode search runs only in the first pass, the
@@ -323,19 +332,39 @@ smaller; the size ratio against `cwebp` was not re-measured here.
 
 ## Roadmap
 
-The lossy encoder is intra only by design. The rate-distortion mode decision, the
-4x4 intra modes, the loop filter and a global rate control are in; what is left
-between it and `cwebp` is:
+The lossy encoder is intra only by design, and the WebP bitstreams themselves are
+conformant: the VP8 and VP8L encoders produce streams that an independent
+decoder (`golang.org/x/image`, a port of libwebp) reproduces sample for sample.
+What is left between this library and `cwebp` is listed below, ordered by
+"how much it costs to fix" versus "how much it buys".
 
-- **Per-segment quantization.** The quantiser index is still fixed for the whole
-  frame, so a complex region and a flat one share the same step. The frame header
-  already supports per-segment deltas; wiring the macroblock activity into them
-  is the next step for target-size accuracy.
-- **More Huffman groups and better clustering.** The meta prefix codes use two
-  groups; libwebp clusters into more groups and also handles the mixed
-  photo/text case that way.
-- **Multi-token partitions.** The frame still uses a single residual partition,
-  which limits decoder parallelism but not size.
+The quality to quantiser curve now follows libwebp's — a piecewise linear map
+followed by a cube root — so a given `Quality` buys roughly the same step as the
+matching `cwebp -q`. On a smooth 320×240 test image the same quality setting now
+reaches about 1.5–3.7 dB more PSNR than the old linear rule did; both paths meet
+at quality 100.
+
+| # | Item | Where it stands | Plan |
+|---|---|---|---|
+| 1 | **Cost model for token probability updates** | `adaptTokenProb` uses a flat 12 bit gain threshold and never looks at `tokenUpdateProb`. About 40 % of the table entries carry an update probability of 255, which RFC 6386 §13.5 marks as "never updated"; signalling those costs ~16 bits, not the ~9 the model assumes, so an update can end up making the stream larger | Price the signalling per entry, as libwebp does in `enc/frame_enc.c` |
+| 2 | **First partition size overflow** | The 19 bit first-partition length in the frame tag is neither masked nor range checked, so a very large canvas silently corrupts the stream | Return an error when it does not fit, like libwebp's `VP8_ENC_ERROR_PARTITION0_OVERFLOW` |
+| 3 | **`LossyOptions.Sharpness`** | `internal/vp8` writes the RFC's 3 bit `sharpness_level` field correctly, but `LossyOptions` has no such field, so the value can never be set from outside the package | Add the field to `LossyOptions` (and fix the comment: like `cwebp -sharpness`, 0 is the sharpest) |
+| 4 | **Animation encoder ignores `AlphaFilter`** | The static lossy path honours `LossyOptions.AlphaFilter`; the animation path hardcodes `ALPHFilterNone` | Read `LossyOpt.AlphaFilter` in the animation encoder too |
+| 5 | **Animation `Duration` overflow** | The 24 bit field is written with a silent truncation (`1<<24` becomes 0, a negative value wraps) | Validate the range before encoding and return an error |
+| 6 | **VP8L colour indexing alpha** | The spec sets every alpha of the index image to 255; the encoder writes 0. Decoding is unaffected because the inverse transform substitutes the whole pixel | Write 255 |
+| 7 | **Duplicate VP8L transforms** | The spec allows each transform type once; the decoder accepts repeats, libwebp rejects them as corrupt | Reject duplicate transform types while decoding |
+| 8 | **VP8L two dimensional distance codes** | The decoder implements the full 120 entry neighbourhood map, but the encoder always writes a plain linear distance: a one pixel distance costs ~10 bits where a neighbourhood code costs 1. This is the largest single source of the remaining lossless size gap | Add `DistanceToPlaneCode` and the lookup table to the encoder, as in libwebp's `src/enc/vp8l_enc.c` |
+| 9 | **Per-segment quantization** | The quantiser index is still fixed for the whole frame, so a complex region and a flat one share the same step. The decoder already supports per-segment quantiser and filter-strength deltas, so only the encoder side is missing | Wire the macroblock activity into the per-segment deltas, as `cwebp -segments` does |
+| 10 | **More Huffman groups and better clustering** | The meta prefix codes use two groups; libwebp clusters into more groups and also handles the mixed photo/text case that way | Cluster into more groups |
+| 11 | **Animation frame differencing** | Every animation frame is encoded in full: there is no frame rectangle cropping and no inter-frame differencing | Add differencing and minimisation, as in libwebp's `WebPAnimEncoder` |
+| 12 | **Multi-token partitions** | The frame still uses a single residual partition, which limits decoder parallelism but not size | Emit more than one partition |
+
+A few further libwebp capabilities are private to it and are not part of the
+WebP bitstream, so the spec does not ask for them: `-near_lossless` source
+pre-filtering, `-alpha_q` lossy alpha, `-sns` spatial noise shaping, `-pass`
+multi-pass optimisation, `-partition_limit` and `-mt` multi-threading. The
+library also has no incremental/streaming decode API yet (libwebp's
+`WebPIDecoder`).
 
 ## Safety / pixel budget
 

@@ -256,8 +256,21 @@ func absDiff(a, b int) int {
 
 // quantIndex 把质量映射到量化索引：质量越高索引越小。
 //
+// 曲线与 libwebp 一致：先把质量归一化到 0..1，再用分段线性映射把「质量」
+// 换算成「压缩率」，最后开立方根（体积大致与量化步长的三次方成正比），
+// 所以 127*(1-c) 就是量化索引。libwebp 在中质量段把 75 当作「看起来不错」的
+// 基准，线性映射在这里会过于粗暴：同为质量 50，线性映射给出 63，libwebp
+// 给出 38，量化步长粗了约 2/3。
+//
 // quantIndex maps quality onto the quantization index: higher quality means a
 // smaller index.
+//
+// The curve matches libwebp: quality is normalised to 0..1, a piecewise linear
+// mapping turns it into a "compressibility", and the cube root of that is
+// taken (size scales roughly with the cube of the quantiser step), so
+// 127*(1-c) is the index. libwebp calibrates the middle of the range so that
+// 75 looks good; a plain linear mapping is far too coarse there: at quality 50
+// it yields 63 where libwebp yields 38, a step about two thirds coarser.
 func quantIndex(quality int) int {
 	if quality < 0 {
 		quality = 0
@@ -265,7 +278,22 @@ func quantIndex(quality int) int {
 	if quality > 100 {
 		quality = 100
 	}
-	return (100 - quality) * 127 / 100
+	q := float64(quality) / 100
+	// 分段线性：0.75 以下压缩率变化慢，以上每一点质量都换更多压缩率。
+	// Piecewise linear: below 0.75 the compressibility climbs slowly, above it
+	// every bit of quality buys more of it.
+	linear := q * (2.0 / 3.0)
+	if q >= 0.75 {
+		linear = 2*q - 1
+	}
+	c := math.Cbrt(linear)
+	qi := int(127 * (1 - c))
+	if qi < 0 {
+		qi = 0
+	} else if qi > 127 {
+		qi = 127
+	}
+	return qi
 }
 
 func newEncoder(w, h int, src *image.YCbCr, quality int) *encoder {
