@@ -297,6 +297,13 @@ type ALPH struct {
 	// Data 是去掉首字节标志后的压缩 alpha 数据。
 	// Data is the compressed alpha data without the leading flag byte.
 	Data []byte
+
+	// reserved 是标志字节里的保留位（bit 6-7）。规范要求它们为 0，解析时保留
+	// 原值，未改动的文件才能逐字节回写。
+	// reserved holds the reserved bits of the flag byte (bits 6-7). The spec
+	// requires them to be zero; the parsed value is kept so that an untouched
+	// file is written back byte for byte.
+	reserved uint8
 }
 
 // ChunkName 返回 ALPH 的 chunk 类型码。
@@ -317,6 +324,7 @@ func (a *ALPH) Parse(c *RawChunk) error {
 	a.Compression = head & 0x3
 	a.Filter = head >> 2 & 0x3
 	a.Preprocessing = head >> 4 & 0x3
+	a.reserved = head >> 6 & 0x3
 	if a.Compression > ALPHCompressionLossless {
 		return errors.Errorf("unsupported alph compression method %d", a.Compression)
 	}
@@ -328,7 +336,7 @@ func (a *ALPH) Parse(c *RawChunk) error {
 // header rebuilds the ALPH flag byte from the compression, filtering and
 // preprocessing fields, the inverse of Parse.
 func (a *ALPH) header() byte {
-	return a.Compression | a.Filter<<2 | a.Preprocessing<<4
+	return a.Compression | a.Filter<<2 | a.Preprocessing<<4 | a.reserved<<6
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +432,13 @@ type ANMF struct {
 	// subs holds all of the frame's sub-chunks in the order they appeared in the
 	// file, known and unknown alike, so data can rebuild the frame unchanged.
 	subs []*riffChunk
+
+	// flags 是帧头里的原始标志字节。规范要求其中 6 个保留位为 0；解析时保留
+	// 原值，未改动的文件才能逐字节回写。
+	// flags is the raw flag byte of the frame header. The spec requires its six
+	// reserved bits to be zero; the parsed value is kept so that an untouched
+	// file is written back byte for byte.
+	flags uint8
 }
 
 // ChunkName 返回 ANMF 的 chunk 类型码。
@@ -447,6 +462,7 @@ func (a *ANMF) Parse(c *RawChunk) error {
 	a.Height = int(readUint24(c.Data[9:12])) + 1
 	a.Duration = int(readUint24(c.Data[12:15]))
 	flags := c.Data[15]
+	a.flags = flags
 	a.Blend = flags&0x2 == 0
 	a.Dispose = flags&0x1 != 0
 
@@ -527,12 +543,16 @@ func (a *ANMF) data() []byte {
 	writeUint24(out[6:9], uint32(a.Width-1))
 	writeUint24(out[9:12], uint32(a.Height-1))
 	writeUint24(out[12:15], uint32(a.Duration))
-	var flags uint8
-	if !a.Blend {
+	var flags uint8 = a.flags
+	if a.Blend {
+		flags &^= 0x2
+	} else {
 		flags |= 0x2
 	}
 	if a.Dispose {
 		flags |= 0x1
+	} else {
+		flags &^= 0x1
 	}
 	out[15] = flags
 	var sawALPH, sawVP8L, sawVP8 bool

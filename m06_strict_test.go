@@ -113,10 +113,57 @@ func TestStrictRejectsViolations(t *testing.T) {
 			chunkBytes("VP8X", vp8xPayload(FlagAnimation, 32, 16)),
 			strictANMF(0, 0, 32, 16, 100, 0, vp8(32, 16)),
 		),
-		"ANIM without the flag": buildWebp(
-			chunkBytes("VP8X", vp8xPayload(FlagAlpha, 32, 16)),
+		"ALPH reserved bits": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagAlpha, 8, 8)),
+			chunkBytes("ALPH", []byte{0xc0, 0x01, 0x02}),
+			vp8(8, 8),
+		),
+		"ANMF reserved flag bits": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagAnimation, 32, 16)),
+			anim,
+			strictANMF(0, 0, 32, 16, 100, 0x04, vp8(32, 16)),
+		),
+		"VP8 and VP8L together": buildWebp(
+			vp8(8, 8),
+			chunkBytes("VP8L", strictVP8L(8, 8)),
+		),
+		"two ALPH chunks": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagAlpha, 8, 8)),
+			alph,
+			alph,
+			vp8(8, 8),
+		),
+		"ALPH next to VP8L": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagAlpha, 8, 8)),
+			alph,
+			chunkBytes("VP8L", strictVP8L(8, 8)),
+		),
+		"ALPH after the bitstream in a frame": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagAnimation, 32, 16)),
+			anim,
+			strictANMF(0, 0, 32, 16, 100, 0, vp8(32, 16), alph),
+		),
+		"image data next to animation frames": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagAnimation, 32, 16)),
 			anim,
 			strictANMF(0, 0, 32, 16, 100, 0, vp8(32, 16)),
+			vp8(32, 16),
+		),
+		"VP8X ICC flag without an ICCP chunk": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagICC, 8, 8)),
+			vp8(8, 8),
+		),
+		"VP8X EXIF flag without an EXIF chunk": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagEXIF, 8, 8)),
+			vp8(8, 8),
+		),
+		"VP8X XMP flag without an XMP chunk": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagXMP, 8, 8)),
+			vp8(8, 8),
+		),
+		"VP8X alpha flag without transparency": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(FlagAlpha, 8, 8)),
+			vp8(8, 8),
 		),
 		"frame outside the canvas": buildWebp(
 			chunkBytes("VP8X", vp8xPayload(FlagAnimation, 32, 32)),
@@ -142,6 +189,49 @@ func TestStrictRejectsViolations(t *testing.T) {
 		}
 		if _, err := ParseWebpBytes(stream); err != nil {
 			t.Errorf("%s: lenient mode rejected the stream: %v", name, err)
+		}
+	}
+}
+
+// TestStrictAcceptsSpecLegalFiles 校验严格模式不会拒绝规范允许的流：元数据与
+// 未知 chunk 的顺序是自由的，没有动画标志时 ANIM chunk 应当被忽略而不是判为
+// 非法。
+//
+// TestStrictAcceptsSpecLegalFiles checks that strict mode does not reject
+// files the spec allows: metadata and unknown chunks may appear out of order,
+// and an ANIM chunk without the animation flag must be ignored rather than
+// rejected.
+func TestStrictAcceptsSpecLegalFiles(t *testing.T) {
+	vp8 := func(w, h int) []byte { return chunkBytes("VP8 ", vp8Payload(w, h)) }
+	anim := chunkBytes("ANIM", make([]byte, 6))
+
+	cases := map[string][]byte{
+		"metadata before the image data": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(0, 8, 8)),
+			chunkBytes("EXIF", []byte("Exif")),
+			chunkBytes("VP8L", strictVP8L(8, 8)),
+		),
+		"metadata between the chunks": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(0, 8, 8)),
+			chunkBytes("XMP ", []byte("xmp")),
+			chunkBytes("VP8L", strictVP8L(8, 8)),
+			chunkBytes("EXIF", []byte("Exif")),
+		),
+		"unknown chunk in the middle": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(0, 8, 8)),
+			chunkBytes("PRIV", []byte("private")),
+			chunkBytes("VP8L", strictVP8L(8, 8)),
+		),
+		"ANIM without the animation flag": buildWebp(
+			chunkBytes("VP8X", vp8xPayload(0, 8, 8)),
+			anim,
+			vp8(8, 8),
+		),
+	}
+
+	for name, stream := range cases {
+		if _, err := ParseWebpBytesWith(stream, ParseOptions{Strict: true}); err != nil {
+			t.Errorf("%s: strict mode rejected a legal stream: %v", name, err)
 		}
 	}
 }

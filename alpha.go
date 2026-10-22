@@ -43,19 +43,40 @@ func decodeAlphaPlane(alpha *ALPH, width, height int) ([]byte, error) {
 // unfilterAlpha 逆向 alpha 平面的水平、垂直或梯度过滤，
 // 就地把预测差分值还原为真实 alpha 值（模 256 加法）。
 //
+// 规范对首行/首列有专门规定：水平滤波时第 0 列的像素（除左上角）由正上方
+// 的像素预测，垂直滤波时第 0 行的像素（除左上角）由左侧的像素预测。
+//
 // unfilterAlpha reverses the horizontal, vertical or gradient filter of an
 // alpha plane in place, turning predictive deltas back into real alpha values
 // (addition modulo 256).
+//
+// The spec has dedicated rules for the first row and column: with the
+// horizontal filter the pixels in column 0 (except the top left one) are
+// predicted from the pixel just above, and with the vertical filter the pixels
+// in row 0 (except the top left one) are predicted from the pixel on the left.
 func unfilterAlpha(plane []byte, width, height int, filter uint8) {
 	switch filter {
 	case ALPHFilterHorizontal:
 		for y := 0; y < height; y++ {
 			row := plane[y*width : (y+1)*width]
+			// 第 0 列由上一行的同列像素预测；第 0 行没有上一行，预测值为 0。
+			// Column 0 is predicted from the pixel above it; row 0 has no
+			// pixel above, so its predictor is 0.
+			if y > 0 {
+				row[0] += plane[(y-1)*width]
+			}
 			for x := 1; x < width; x++ {
 				row[x] += row[x-1]
 			}
 		}
 	case ALPHFilterVertical:
+		// 第 0 行由左侧像素预测；左上角的预测值为 0。
+		// Row 0 is predicted from the pixel on the left; the top left pixel
+		// has a predictor of 0.
+		row := plane[:width]
+		for x := 1; x < width; x++ {
+			row[x] += row[x-1]
+		}
 		for y := 1; y < height; y++ {
 			row := plane[y*width : (y+1)*width]
 			prev := plane[(y-1)*width : y*width]

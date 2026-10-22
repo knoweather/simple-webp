@@ -44,25 +44,51 @@ func alphaPlane(m image.Image) ([]byte, bool) {
 // filterAlpha 对 alpha 平面施加预测差分（unfilterAlpha 的逆过程），让后续熵
 // 编码看到更小的残差。四种方式与解码端一一对应。
 //
+// 规范对首行/首列有专门规定：水平滤波时第 0 列的像素（除左上角）减去正上方
+// 的像素，垂直滤波时第 0 行的像素（除左上角）减去左侧的像素。
+//
 // filterAlpha applies the predictive differencing the decoder reverses in
 // unfilterAlpha, so the entropy coder sees smaller residuals. The four methods
 // mirror the decoder.
+//
+// The spec has dedicated rules for the first row and column: with the
+// horizontal filter the pixels in column 0 (except the top left one) subtract
+// the pixel just above, and with the vertical filter the pixels in row 0
+// (except the top left one) subtract the pixel on the left.
 func filterAlpha(plane []byte, width, height int, filter uint8) {
 	switch filter {
 	case ALPHFilterHorizontal:
-		for y := 0; y < height; y++ {
+		// 逐行从右往左做差分，保证用到的左邻仍是原值；行也从下往上遍历，
+		// 保证第 0 列用到的上一行仍是原值。
+		// Each row is differenced from right to left so that the left
+		// neighbour is still the original value, and the rows are walked
+		// bottom up so that the row above column 0 is still original too.
+		for y := height - 1; y >= 0; y-- {
 			row := plane[y*width : (y+1)*width]
 			for x := width - 1; x >= 1; x-- {
 				row[x] -= row[x-1]
 			}
+			if y > 0 {
+				row[0] -= plane[(y-1)*width]
+			}
 		}
 	case ALPHFilterVertical:
+		// 第 1 行及以下由上邻预测，从下往上遍历保证上邻仍是原值。
+		// Rows 1 and below are predicted from the pixel above; walking the
+		// rows bottom up keeps that neighbour original.
 		for y := height - 1; y >= 1; y-- {
 			row := plane[y*width : (y+1)*width]
 			prev := plane[(y-1)*width : y*width]
 			for x := 0; x < width; x++ {
 				row[x] -= prev[x]
 			}
+		}
+		// 第 0 行由左邻预测，从右往左做差分；左上角保持不变。
+		// Row 0 is predicted from the pixel on the left, differenced from
+		// right to left; the top left pixel is left alone.
+		row := plane[:width]
+		for x := width - 1; x >= 1; x-- {
+			row[x] -= row[x-1]
 		}
 	case ALPHFilterGradient:
 		for y := height - 1; y >= 0; y-- {

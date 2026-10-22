@@ -614,6 +614,15 @@ func (w *Webp) DeleteRawChunk(name FourCC) int {
 	return removed
 }
 
+// metadataChunkRank 是元数据与未知 chunk 的排位。它们的顺序规范允许自由
+// （"Metadata and unknown chunks MAY appear out of order"），排在所有重建类
+// chunk 之后。
+//
+// metadataChunkRank is the rank of the metadata and unknown chunks. Their
+// order is free according to the spec ("Metadata and unknown chunks MAY
+// appear out of order"); they rank after every reconstructing chunk.
+const metadataChunkRank = 6
+
 // chunkInsertRank 返回一种 chunk 在容器顺序中的排位，新 chunk 依排位插入。
 func chunkInsertRank(name FourCC) int {
 	switch name {
@@ -630,14 +639,14 @@ func chunkInsertRank(name FourCC) int {
 	case VP8Chunk, VP8LChunk:
 		return 5
 	default:
-		return 6
+		return metadataChunkRank
 	}
 }
 
 // chunkInsertIndex 返回把排位为 r 的新 chunk 插入 names 时的下标：跳过所有
-// 排位不大于 r 的 chunk；排位 6 的 chunk 追加到尾部。
+// 排位不大于 r 的 chunk；排位为 metadataChunkRank 的 chunk 追加到尾部。
 func chunkInsertIndex(names []FourCC, r int) int {
-	if r >= 6 {
+	if r >= metadataChunkRank {
 		return len(names)
 	}
 	for i, n := range names {

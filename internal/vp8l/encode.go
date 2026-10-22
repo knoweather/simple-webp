@@ -38,12 +38,35 @@ type Options struct {
 // length, and the log2 of the predictor block edge (2^predictorBits pixels).
 const (
 	encoderMaxMatch = 4096
-	encoderWindow   = 1 << 20
 	encoderHashBits = 16
 	encoderMaxChain = 48
 	encoderMinMatch = 3
 	predictorBits   = 4
 )
+
+// maxDistanceCode 是无损码流允许的最大距离码：规范里距离码的前缀码 39 覆盖
+// 786433..1048576（18 位附加位），这就是上限。
+//
+// maxDistanceCode is the largest distance code the lossless bitstream allows:
+// prefix code 39 of the distance code space covers 786433..1048576 with 18
+// extra bits, and that is the end of the space.
+const maxDistanceCode = 1 << 20
+
+// encoderWindow 是后向引用的最大像素距离。距离以「距离码 = 距离 + 120」写出
+// （1..120 是二维邻域的距离码），而距离码的上限是 maxDistanceCode，所以窗口
+// 必须留出这 120 的偏移；否则距离码会越过码字空间，既找不到对应的前缀码，
+// 也会让距离频次数组越界。窗口与距离码空间的这个换算由
+// TestDistanceCodeFitsTheCodeSpace 钉住。
+//
+// encoderWindow is the largest backward reference distance in pixels. The
+// distance is written as "distance code = distance + 120" (codes 1..120 are
+// the two dimensional neighbourhood) and the distance code space ends at
+// maxDistanceCode, so the window has to leave room for that offset; otherwise
+// the distance code runs past the end of the code space, where there is no
+// prefix code for it and the distance frequency array does not reach. The
+// conversion between the window and the code space is pinned by
+// TestDistanceCodeFitsTheCodeSpace.
+const encoderWindow = maxDistanceCode - 120
 
 // errEmptyImage 报告宽高非正、或像素缓冲短于 width*height 的输入。
 //
@@ -669,7 +692,7 @@ func (e *encoder) writeEntropySection(pix []uint32, tokens []token, cacheBits in
 		case evCopy:
 			prefix, _, _ := encodePrefix(ev.length)
 			freq[0][256+prefix]++
-			dprefix, _, _ := encodePrefix(ev.dist + 120)
+			dprefix, _, _ := encodePrefix(distanceCode(ev.dist))
 			freq[4][dprefix]++
 		}
 	}
@@ -693,7 +716,7 @@ func (e *encoder) writeEntropySection(pix []uint32, tokens []token, cacheBits in
 			prefix, extra, n := encodePrefix(ev.length)
 			e.writeSymbol(trees[0], 256+prefix)
 			e.w.writeBits(extra, n)
-			dprefix, dextra, dn := encodePrefix(ev.dist + 120)
+			dprefix, dextra, dn := encodePrefix(distanceCode(ev.dist))
 			e.writeSymbol(trees[4], dprefix)
 			e.w.writeBits(dextra, dn)
 		}
@@ -906,7 +929,7 @@ func planMeta(pix []uint32, tokens []token, width, height int) (metaPlan, bool) 
 		case evCopy:
 			prefix, _, _ := encodePrefix(ev.length)
 			freq[g][0][256+prefix]++
-			dprefix, _, _ := encodePrefix(ev.dist + 120)
+			dprefix, _, _ := encodePrefix(distanceCode(ev.dist))
 			freq[g][4][dprefix]++
 		}
 	}
@@ -962,7 +985,7 @@ func (e *encoder) writeEvent(trees *[5]huffmanCode, ev vp8lEvent) {
 		prefix, extra, n := encodePrefix(ev.length)
 		e.writeSymbol(trees[0], 256+prefix)
 		e.w.writeBits(extra, n)
-		dprefix, dextra, dn := encodePrefix(ev.dist + 120)
+		dprefix, dextra, dn := encodePrefix(distanceCode(ev.dist))
 		e.writeSymbol(trees[4], dprefix)
 		e.w.writeBits(dextra, dn)
 	}
@@ -1092,6 +1115,18 @@ func encodePrefix(v int) (prefix uint32, extra uint32, nbits uint) {
 	prefix = uint32(2+2*b) + bit
 	offset := (2 + int(bit)) << b
 	return prefix, uint32(e - offset), uint(b)
+}
+
+// distanceCode 把像素距离转成无损码流里的距离码：线性距离从 121 开始，1..120
+// 留给二维邻域的距离码。调用方必须保证距离不超过 encoderWindow，这样得到的
+// 距离码才落在码字空间里。
+//
+// distanceCode turns a pixel distance into the distance code of the lossless
+// bitstream: linear distances start at 121, codes 1..120 are reserved for the
+// two dimensional neighbourhood. The caller must keep the distance within
+// encoderWindow so that the distance code stays inside the code space.
+func distanceCode(dist int) int {
+	return dist + 120
 }
 
 /*
