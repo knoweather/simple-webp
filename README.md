@@ -7,6 +7,8 @@ module is `github.com/pkg/errors` for error wrapping.
 
 <p>
 <a href="https://github.com/knoweather/simple-webp/actions/workflows/ci.yml"><img src="https://github.com/knoweather/simple-webp/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+<a href="https://goreportcard.com/report/github.com/knoweather/simple-webp"><img src="https://goreportcard.com/badge/github.com/knoweather/simple-webp" alt="Go Report Card"></a>
+<a href="https://scorecard.dev/viewer/?uri=github.com/knoweather/simple-webp"><img src="https://img.shields.io/ossf-scorecard/github.com/knoweather/simple-webp?label=openssf%20scorecard" alt="OpenSSF Scorecard"></a>
 <a href="https://pkg.go.dev/github.com/knoweather/simple-webp"><img src="https://pkg.go.dev/badge/github.com/knoweather/simple-webp.svg" alt="Go Reference"></a>
 <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/knoweather/simple-webp" alt="Go version"></a>
 <a href="LICENSE"><img src="https://img.shields.io/github/license/knoweather/simple-webp" alt="License"></a>
