@@ -36,8 +36,8 @@ if err := webp.Encode(&out, img, &webp.EncodeOptions{}); err != nil { // lossles
   `DeleteRawChunk`) → write; unknown chunks and untouched pixels survive unchanged,
   metadata chunks (ICCP/EXIF/XMP) are carried through and never re-encoded.
 - **Complete codec**: VP8/VP8L/ALPH/animation decoding plus an encoder with loop
-  filter, target-size rate control, color transform, color cache, meta-Huffman
-  groups and animation output.
+  filter, target-size rate control, per-segment quantization, color transform,
+  color cache, meta-Huffman groups and animation output.
 - **Strict when you want it**: `ParseOptions.Strict` enforces the container spec's
   MUST rules (chunk order, VP8X first, reserved bits, canvas and frame geometry,
   flags matching the payload); the default stays lenient.
@@ -63,7 +63,7 @@ preserved, byte-exact write back.
 | Metadata editing | ✅ | rewrite with `ICCP`/`EXIF`/`XMP ` chunks, **pixels never re-encoded**, byte-exact when untouched; new chunks land where the spec puts their type |
 | Container editing | ✅ | `NewWebp` + `SetImage` build a file from scratch, `AddFrame`/`RemoveFrame` edit animations, `DeleteRawChunk` removes consumed chunks, `InvalidateCache` drops the decode cache |
 | VP8L lossless encode | ✅ | color-indexing / subtract-green / predictor / **color transform** / **color cache** / **meta-Huffman groups** / LZ77 / Huffman (≤15 bits); the cheaper of the variants is kept |
-| VP8 lossy encode | ✅ | intra only: rate-distortion mode decision, 16x16 or 4x4 luma modes, 8x8 chroma modes, **loop filter**, **target-size rate control**; lossy + alpha (`VP8X`+`ALPH`) |
+| VP8 lossy encode | ✅ | intra only: rate-distortion mode decision, 16x16 or 4x4 luma modes, 8x8 chroma modes, **loop filter**, **target-size rate control**, **per-segment quantization** (`LossyOptions.Segment`); lossy + alpha (`VP8X`+`ALPH`) |
 | Animation encode | ✅ | `EncodeAnimation` writes `VP8X`+`ANIM`+`ANMF`, lossless or lossy frames, per-frame `ALPH` |
 
 ## Install
@@ -116,13 +116,32 @@ _, err := w.WriteTo(&buf) // untouched chunks are copied byte for byte, pixels n
 New chunks go where the container spec puts their type: `VP8X` first, `ICCP`
 right after it and before `ANIM`, `ANMF` and the image data, `ANIM` before the
 first `ANMF`, `ALPH` before `VP8 `/`VP8L`, and `EXIF`, `XMP` or unknown types at
-the end. `DeleteRawChunk` also removes the chunks parsing already consumed
-(`ALPH`, `ANIM`, `ANMF`, `VP8X`, `VP8`, `VP8L`) and clears the matching `VP8X`
-flags. A removal that would leave the file invalid — the only image data,
-`ANIM` while frames remain, `VP8X` while an extended feature remains — is
-refused: nothing is deleted and the call returns 0. Unknown sub-chunks inside an
-`ANMF` frame keep their original position, so frame-level application data
-survives a parse/write cycle.
+the end. A single-instance chunk that is already present is refused (a second
+copy would make the file invalid), and so is a chunk combination the spec
+forbids — `VP8` next to `VP8L`, `ALPH` next to `VP8L`. `DeleteRawChunk` also
+removes the chunks parsing already consumed (`ALPH`, `ANIM`, `ANMF`, `VP8X`,
+`VP8`, `VP8L`) and clears the matching `VP8X` flags. A removal that would leave
+the file invalid — the only image data, `ANIM` while frames remain, `VP8X`
+while an extended feature remains — is refused: nothing is deleted and the call
+returns 0. Unknown sub-chunks inside an `ANMF` frame keep their original
+position, so frame-level application data survives a parse/write cycle. An
+`ICCP`/`EXIF`/`XMP`/`ALPH`/`ANIM` assigned directly to its struct is written
+even when the source file had none; `WriteTo` returns an error for an odd frame
+position, a duration beyond 24 bits, an `ANIM` without frames or an `ALPH` next
+to a `VP8L`.
+
+### Decode straight from a stream
+
+```go
+img, err := simple_webp.DecodeWebp(resp.Body, simple_webp.DecodeOptions{})
+```
+
+`DecodeWebp` parses and decodes from any `io.Reader` — a file, a network
+response or a `bytes.Reader` — streaming the container in chunk by chunk, so the
+caller never has to hold the whole file in memory first. `(*Webp).DecodeInto`
+decodes one still image into an `*image.NRGBA` you already own, which saves the
+result allocation when a pipeline decodes image after image; a size mismatch,
+a nil buffer or an animation is an error and leaves the buffer untouched.
 
 ### Strict parsing
 
@@ -173,6 +192,7 @@ err := simple_webp.EncodeLossy(out, img, &simple_webp.LossyOptions{
     FilterLevel:  20,              // VP8 loop filter 0..63; 0 derives it from the quality
     TargetBytes:  0,               // >0: pick the quality closest to a size
     AlphaFilter:  simple_webp.ALPHFilterGradient,
+    Segment:      true,            // per-segment quantisation, can only shrink the file
 })
 ```
 
@@ -274,7 +294,7 @@ vp8.go         VP8 → NRGBA (9:3:3:1 fancy upsampling + fixed-point BT.601)
 image.go       image.RegisterFormat / Decode / DecodeConfig / image.Image
 encode.go      image.Image → VP8L → RIFF
 encode_lossy.go  image.Image → VP8 (+ ALPH) → RIFF
-internal/vp8/  VP8 lossy decoder + encoder (bool coder, prediction, IDCT, loop filter, RD mode decision, rate control)
+internal/vp8/  VP8 lossy decoder + encoder (bool coder, prediction, IDCT, loop filter, RD mode decision, rate control, segment quantisation)
 internal/vp8l/ VP8L lossless decoder + encoder (bitstream, Huffman, LZ77, transforms, colour cache, colour transform, meta-Huffman)
 testdata/      fixtures generated against libwebp (.webp + .rgba references)
 ```
@@ -332,14 +352,18 @@ smaller; the size ratio against `cwebp` was not re-measured here.
   plus the exact number of bits their tokens would take. The luma uses either
   one 16x16 mode or sixteen 4x4 modes, whichever is cheaper and the chroma uses
   8x8 modes. The loop filter and a target-size rate control are in; the rate
-  control moves the global quantiser only, per-segment quantization is still
-  open, so the size at a given quality still depends on the content. The
-  quality to quantiser curve itself follows libwebp's, so a given `Quality`
-  selects about the same step as the matching `cwebp -q`
+  control moves the global quantiser only, and `LossyOptions.Segment` adds
+  per-segment steps on top (opt-in, and the encoder races the segmented and
+  unsegmented plans so it can only shrink a file), so the size at a given
+  quality still depends on the content. The quality to quantiser curve itself
+  follows libwebp's, so a given `Quality` selects about the same step as the
+  matching `cwebp -q`
 - Lossy encoding runs twice: the first pass collects token statistics and the
   second encodes with probabilities adapted to them, which costs about 1.8x the
   time of a single pass. The mode search runs only in the first pass, the
-  second reuses the modes it found
+  second reuses the modes it found. With `Segment` on, the encoder races three
+  plans (unsegmented, regular step, double step), so it costs up to three
+  times that again
 - The rate distortion search is what makes the encoder slow: scoring ten 4x4
   modes for every block of every macroblock means running the transform and
   the quantiser once per candidate
@@ -423,6 +447,8 @@ budget **after reading the header and before allocating pixel buffers**:
   from its declared length, so a tiny file whose only chunk claims 1 GB fails
   without that allocation; a chunk that promises more data than the stream
   holds is an error rather than a silent end of stream
+- `ParseOptions.MaxChunkSize` (default `1<<30`) tightens the per-chunk cap for
+  untrusted input; the nested sub-chunks inside an `ANMF` are bound by it too
 - data after the RIFF File Size is ignored, as the spec allows; `verifySize`
   still rejects a stream whose size field does not match the actual length
 - `Frames` checks the VP8X canvas against the budget before allocating it and

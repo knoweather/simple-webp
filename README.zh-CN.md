@@ -35,7 +35,7 @@ if err := webp.Encode(&out, img, &webp.EncodeOptions{}); err != nil { // lossles
   `DeleteRawChunk`）→ 写回；未知 chunk 与未改动的像素原样保留，ICCP/EXIF/XMP 等
   元数据只是搬运、绝不重编码图像数据。
 - **编解码完整**：VP8 / VP8L / ALPH / 动画解码，外加带 loop filter、目标体积码率控制、
-  color transform、color cache、meta-Huffman 分组与动画输出的编码器。
+  逐段量化、color transform、color cache、meta-Huffman 分组与动画输出的编码器。
 - **需要时可严格**：`ParseOptions.Strict` 校验容器规范的 MUST（chunk 顺序、VP8X 必须最前、
   保留位、画布与帧矩形、标志与实际数据一致）；默认仍宽松。
 
@@ -59,7 +59,7 @@ chunk 化、原始字节保留、可字节级回写。
 | 元数据编辑 | ✅ | 追加 `ICCP`/`EXIF`/`XMP ` 后回写，**不重编码像素**，未改动时字节级还原；新 chunk 按类型落到规范位置 |
 | 容器编辑 | ✅ | `NewWebp` + `SetImage` 从零构造，`AddFrame`/`RemoveFrame` 编辑动画，`DeleteRawChunk` 删已消费 chunk，`InvalidateCache` 清解码缓存 |
 | VP8L 无损编码 | ✅ | 色彩索引 / subtract-green / predictor / **颜色变换** / **颜色缓存** / **meta-Huffman 分组** / LZ77 / Huffman（≤15 位），多种写法取最短 |
-| VP8 有损编码 | ✅ | 仅帧内：率失真模式决策、16x16 或 4×4 亮度模式、8×8 色度模式、**环路滤波**、**目标体积码率控制**；支持有损 + alpha（`VP8X`+`ALPH`） |
+| VP8 有损编码 | ✅ | 仅帧内：率失真模式决策、16x16 或 4×4 亮度模式、8×8 色度模式、**环路滤波**、**目标体积码率控制**、**逐段量化**（`LossyOptions.Segment`）；支持有损 + alpha（`VP8X`+`ALPH`） |
 | 动画编码 | ✅ | `EncodeAnimation` 写 `VP8X`+`ANIM`+`ANMF`，帧可有损或无损，透明帧自带 `ALPH` |
 
 ## 安装
@@ -111,11 +111,14 @@ _, err := w.WriteTo(&buf)   // 未改动的 chunk 逐字节复制，像素数据
 
 新 chunk 按容器规范给该类型规定的位置插入：`VP8X` 最前，`ICCP` 紧随其后、排在
 `ANIM`、`ANMF` 与图像数据之前，`ANIM` 在第一个 `ANMF` 之前，`ALPH` 在 `VP8 `/`VP8L`
-之前，`EXIF`、`XMP` 与未知类型排在末尾。`DeleteRawChunk` 也能删掉解析时已被消费的
-`ALPH`、`ANIM`、`ANMF`、`VP8X`、`VP8`、`VP8L`，并同步清除 `VP8X` 的标志位；会让
-文件变成非法流的删除（唯一的图像数据、还有帧时删 `ANIM`、还有扩展特性时删 `VP8X`）
-一律不生效：什么都不删，返回 0。`ANMF` 帧内的未知子 chunk 保持原位置，帧级应用
-数据经解析、写回后不丢。
+之前，`EXIF`、`XMP` 与未知类型排在末尾。流里已存在的单实例 chunk 拒绝重复插入
+（两份会让文件非法），规范禁止的组合（`VP8` 配 `VP8L`、`ALPH` 配 `VP8L`）同样拒绝。
+`DeleteRawChunk` 也能删掉解析时已被消费的 `ALPH`、`ANIM`、`ANMF`、`VP8X`、`VP8`、
+`VP8L`，并同步清除 `VP8X` 的标志位；会让文件变成非法流的删除（唯一的图像数据、
+还有帧时删 `ANIM`、还有扩展特性时删 `VP8X`）一律不生效：什么都不删，返回 0。
+`ANMF` 帧内的未知子 chunk 保持原位置，帧级应用数据经解析、写回后不丢。直接赋值给
+结构体的 `ICCP`/`EXIF`/`XMP`/`ALPH`/`ANIM` 即使原文件没有也会写出；奇数帧坐标、
+超出 24 位的时长、没有帧的 `ANIM`、`VP8L` 旁的 `ALPH` 都会让 `WriteTo` 返回错误。
 
 ### 动画
 
@@ -131,6 +134,17 @@ for i, f := range frames {
 `FramesWith(FrameOptions{...})` 可以同时设置两者，画布在分配任何像素缓冲之前就被检查。
 只要某一帧时用 `FrameAt(i, FrameOptions{})`：它顺序合成到第 i 帧就停，不克隆中间画布；
 `AnimationInfo()` 一次给出画布尺寸、循环次数、背景色与帧数。
+
+### 从流里直接解码
+
+```go
+img, err := simple_webp.DecodeWebp(resp.Body, simple_webp.DecodeOptions{})
+```
+
+`DecodeWebp` 从任意 `io.Reader` 解析并解码——文件、网络响应、`bytes.Reader` 都行，
+容器按 chunk 逐个流入，调用方不需要先把整个文件读进内存。`(*Webp).DecodeInto` 把
+一张静态图解进调用方自己的 `*image.NRGBA`，连续解码多张图时省掉结果分配；尺寸不符、
+nil 缓冲或动画文件都返回错误，且不会改动缓冲内容。
 
 ### 严格解析
 
@@ -176,6 +190,7 @@ err := simple_webp.EncodeLossy(out, img, &simple_webp.LossyOptions{
     FilterLevel: 20,   // VP8 环路滤波 0..63；0 = 按质量自动
     TargetBytes: 0,    // >0：挑最接近该体积的质量
     AlphaFilter: simple_webp.ALPHFilterGradient,
+    Segment:     true, // 逐段量化，只会让体积变小
 })
 ```
 
@@ -225,7 +240,9 @@ err := simple_webp.EncodeLossy(out, img, &simple_webp.LossyOptions{
 「重建失真 + 权衡系数 × 码长」打分，码长取系数 token 实际要花的比特数，取代价
 最小的一个。宏块的亮度要么用整块 16×16 模式，要么用十六个 4×4 模式，看哪条路
 更便宜；色度用四种 8×8 模式之一。帧头现在会写真实的环路滤波参数，`TargetBytes`
-打开目标体积码率控制（只调全局量化，逐段量化还没做）。
+打开目标体积码率控制（只调全局量化）；`LossyOptions.Segment` 在此之上打开逐段
+量化——按宏块活动度分四段，平坦侧比基础量化粗一档或两档，编码器会同时试分段与
+不分段的方案并只保留更小的，所以只会省体积、不会增体积。
 
 ### 自定义 chunk
 
@@ -260,7 +277,7 @@ simple-webp/
 ├── image.go       image.RegisterFormat / Decode / DecodeConfig / image.Image
 ├── encode.go      image.Image → VP8L → RIFF
 ├── encode_lossy.go  image.Image → VP8（+ ALPH）→ RIFF
-├── internal/vp8/  VP8 有损解码器 + 编码器（bool 编解码、预测、IDCT、loop filter、率失真、码率控制）
+├── internal/vp8/  VP8 有损解码器 + 编码器（bool 编解码、预测、IDCT、loop filter、率失真、码率控制、逐段量化）
 ├── internal/vp8l/ VP8L 无损解码器 + 编码器（位流、Huffman、LZ77、变换、颜色缓存、颜色变换、meta-Huffman）
 └── testdata/      与 libwebp 对照的 fixture（.webp + .rgba 基准）
 ```
@@ -318,7 +335,8 @@ Windows / amd64，`go test -run XXX -bench . -benchtime 200ms`，本系列容器
   逐段量化（见「演进方向」）。质量→量化曲线本身已经对齐 libwebp，同一个 `Quality`
   选出的量化步长与对应的 `cwebp -q` 基本一致。
 - 有损编码跑两遍：第一遍收集 token 统计，第二遍用据此调整的概率表编码，耗时约为
-  单遍的 1.8 倍。模式搜索只在第一遍做，第二遍直接沿用第一遍选好的模式。
+  单遍的 1.8 倍。模式搜索只在第一遍做，第二遍直接沿用第一遍选好的模式。打开
+  `Segment` 后编码器要竞赛三个方案（不分段、常规步长、双倍步长），耗时再乘约三倍。
 - 率失真搜索是编码变慢的主因：每个宏块的每个 4×4 块都要把十种模式各跑一遍
   变换与量化。
 - 无损编码现在会试写最多四种写法（颜色变换开/关、颜色缓存、meta-Huffman 分块）并
@@ -380,6 +398,8 @@ libwebp `WebPIDecoder` 那样「边追加边解码」的增量接口，也没有
 - chunk 载荷按实际到达的字节流式读入，不再按声明长度预分配：几十字节、只含一个声明
   1 GB 的 chunk 头的文件会直接失败，不会有那次分配；声明长度大于实际数据时按截断报错，
   而不是当成流正常结束。
+- `ParseOptions.MaxChunkSize`（默认 `1<<30`）可进一步收紧单个 chunk 的载荷上限，
+  解析不可信输入时用；`ANMF` 内的嵌套子 chunk 同样受它约束。
 - RIFF File Size 之后的数据一律忽略（规范允许）；`verifySize` 仍会拒绝大小字段与
   实际长度不符的流。
 - `Frames` 在分配画布之前按像素预算检查 VP8X 声明的画布，并用
