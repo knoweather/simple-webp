@@ -6,9 +6,13 @@ No cgo, no libwebp: the codec is written from scratch and returns standard
 module is `github.com/pkg/errors` for error wrapping.
 
 <p>
+<a href="https://github.com/knoweather/simple-webp/actions/workflows/ci.yml"><img src="https://github.com/knoweather/simple-webp/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 <a href="https://pkg.go.dev/github.com/knoweather/simple-webp"><img src="https://pkg.go.dev/badge/github.com/knoweather/simple-webp.svg" alt="Go Reference"></a>
-<a href="go.mod"><img src="https://img.shields.io/badge/go-1.27%2B-00ADD8?logo=go" alt="Go 1.27+"></a>
-<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"></a>
+<a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/knoweather/simple-webp" alt="Go version"></a>
+<a href="LICENSE"><img src="https://img.shields.io/github/license/knoweather/simple-webp" alt="License"></a>
+<a href="https://github.com/knoweather/simple-webp/tags"><img src="https://img.shields.io/github/v/tag/knoweather/simple-webp?sort=semver" alt="Latest tag"></a>
+<img src="https://img.shields.io/badge/CGO-disabled-success" alt="CGO disabled">
+<img src="https://img.shields.io/badge/WASM-browser%20%26%20node-blueviolet" alt="WASM">
 </p>
 
 **English** | [简体中文](./README.zh-CN.md)

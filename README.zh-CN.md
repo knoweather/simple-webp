@@ -5,9 +5,13 @@
 （已注册 `image.RegisterFormat`），唯一的第三方模块是 `github.com/pkg/errors`（仅用于错误包裹）。
 
 <p>
+<a href="https://github.com/knoweather/simple-webp/actions/workflows/ci.yml"><img src="https://github.com/knoweather/simple-webp/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 <a href="https://pkg.go.dev/github.com/knoweather/simple-webp"><img src="https://pkg.go.dev/badge/github.com/knoweather/simple-webp.svg" alt="Go Reference"></a>
-<a href="go.mod"><img src="https://img.shields.io/badge/go-1.27%2B-00ADD8?logo=go" alt="Go 1.27+"></a>
-<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"></a>
+<a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/knoweather/simple-webp" alt="Go version"></a>
+<a href="LICENSE"><img src="https://img.shields.io/github/license/knoweather/simple-webp" alt="License"></a>
+<a href="https://github.com/knoweather/simple-webp/tags"><img src="https://img.shields.io/github/v/tag/knoweather/simple-webp?sort=semver" alt="Latest tag"></a>
+<img src="https://img.shields.io/badge/CGO-disabled-success" alt="CGO disabled">
+<img src="https://img.shields.io/badge/WASM-browser%20%26%20node-blueviolet" alt="WASM">
 </p>
 
 [English](./README.md) | **简体中文**
