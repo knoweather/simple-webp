@@ -1,5 +1,12 @@
 //go:build js && wasm
 
+// Package wasm 是 WebP 的 WebAssembly（WASM）解码前端，供浏览器与 Node.js
+// 使用：把 WebP 字节流解码成 RGBA 像素，不做编码，也不依赖 libwebp 或 cgo。
+// 构建方式见仓库的 wasm/README.md。
+//
+// Package wasm is the WebAssembly (WASM) front end for WebP decoding in the
+// browser and in Node.js: it decodes a WebP byte stream into RGBA pixels and
+// never encodes, with no libwebp and no cgo. See wasm/README.md for the build.
 package wasm
 
 import "syscall/js"

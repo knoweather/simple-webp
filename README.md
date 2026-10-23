@@ -1,6 +1,7 @@
 # simple-webp
 
-Pure-Go **WebP decode + encode** — VP8 lossy, VP8L lossless, ALPH, animation.
+Pure-Go **WebP decode + encode** — VP8 lossy, VP8L lossless, ALPH, animation —
+plus a **WebAssembly (WASM)** decoder for the browser and Node.js.
 No cgo, no libwebp: the codec is written from scratch and returns standard
 `image.Image` (registered with `image.RegisterFormat`), and the only third-party
 module is `github.com/pkg/errors` for error wrapping.
@@ -38,6 +39,9 @@ if err := webp.Encode(&out, img, &webp.EncodeOptions{}); err != nil { // lossles
 - **Complete codec**: VP8/VP8L/ALPH/animation decoding plus an encoder with loop
   filter, target-size rate control, per-segment quantization, color transform,
   color cache, meta-Huffman groups and animation output.
+- **WebAssembly (WASM)**: the decoder compiled to WASM for the browser and
+  Node.js — decode WebP to RGBA for `<canvas>` with no libwebp and no cgo
+  (`wasm/`).
 - **Strict when you want it**: `ParseOptions.Strict` enforces the container spec's
   MUST rules (chunk order, VP8X first, reserved bits, canvas and frame geometry,
   flags matching the payload); the default stays lenient.
@@ -275,6 +279,28 @@ func (c *myChunk) ChunkName() simple_webp.FourCC { return simple_webp.FourCC("AB
 func (c *myChunk) Parse(chunk *simple_webp.RawChunk) error { c.Data = chunk.Data; return nil }
 ```
 
+## WebAssembly (WASM): decode WebP in the browser and Node
+
+`wasm/` is a **decoder only** WebAssembly (WASM) build: a WebP decoder for the
+browser and Node.js that turns a WebP byte stream into RGBA pixels ready for
+`<canvas>`, with no libwebp, no cgo and no re-encoding. Encoding is out of
+scope.
+
+- Build: `wasm/build.ps1` (Windows) or `wasm/build.sh`; output is
+  `wasm/example/main.wasm` plus a copied `wasm_exec.js`.
+- JS API (installed on the global object by `wasm.Register()`):
+  - `webpDecode(bytes) -> { width, height, hasAlpha, hasAnimation, rgba }`
+    (returns `{ error }` on failure; first frame for animations)
+  - `webpDecodeFrames(bytes) -> [ { width, height, duration, rgba }, … ]`
+    (all animation frames at canvas size; a still image yields one frame)
+  - `webpInfo(bytes) -> { width, height, hasAlpha, hasAnimation, hasICC,
+    hasEXIF, hasXMP, frameCount }` (no pixel decode; VP8X flags + frame count)
+  - `bytes` may be a `Uint8Array` or `ArrayBuffer`; `rgba` is a straight-alpha
+    `Uint8Array` that must be consumed synchronously (Go-managed memory).
+- Decoding covers the full extended format: VP8X alpha (lossless and lossy
+  `VP8X+ALPH`), animation (`VP8X+ANIM+ANMF`), and the ICC/EXIF/XMP metadata
+  flags. Full demo: `wasm/example/index.html` and `wasm/README.md`.
+
 ## Layout
 
 ```
@@ -462,27 +488,6 @@ Tighten the budget yourself, e.g. trust only small images:
 ```go
 img, err := w.ToImageWith(simple_webp.DecodeOptions{MaxPixels: 4096 * 4096})
 ```
-
-## WebAssembly (read-only decode)
-
-`wasm/` ships a WebAssembly **decoder only**: it turns a WebP byte stream into
-RGBA pixels ready for `<canvas>` — no re-encoding, no writes. Encoding is out
-of scope.
-
-- Build: `wasm/build.ps1` (Windows) or `wasm/build.sh`; output is
-  `wasm/example/main.wasm` plus a copied `wasm_exec.js`.
-- JS API (installed on the global object by `wasm.Register()`):
-  - `webpDecode(bytes) -> { width, height, hasAlpha, hasAnimation, rgba }`
-    (returns `{ error }` on failure; first frame for animations)
-  - `webpDecodeFrames(bytes) -> [ { width, height, duration, rgba }, … ]`
-    (all animation frames at canvas size; a still image yields one frame)
-  - `webpInfo(bytes) -> { width, height, hasAlpha, hasAnimation, hasICC,
-    hasEXIF, hasXMP, frameCount }` (no pixel decode; VP8X flags + frame count)
-  - `bytes` may be a `Uint8Array` or `ArrayBuffer`; `rgba` is a straight-alpha
-    `Uint8Array` that must be consumed synchronously (Go-managed memory).
-- Decoding covers the full extended format: VP8X alpha (lossless and lossy
-  `VP8X+ALPH`), animation (`VP8X+ANIM+ANMF`), and the ICC/EXIF/XMP metadata
-  flags. Full demo: `wasm/example/index.html` and `wasm/README.md`.
 
 ## Testing
 

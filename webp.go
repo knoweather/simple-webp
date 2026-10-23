@@ -1,12 +1,16 @@
 // Package simple_webp 解析与编辑 WebP（RIFF）容器：读取 RIFF 头与全部 chunk，
 // 解码容器级 chunk（VP8X、VP8、VP8L、ALPH、ANIM、ANMF、ICCP、EXIF、XMP），
 // 并支持在不重新编码像素的前提下增删元数据 chunk、按原始顺序写回整个流。
+// 纯 Go 实现，不依赖 cgo 与 libwebp；浏览器与 Node.js 用的 WebAssembly
+// （WASM）解码前端在 wasm 子包里。
 //
 // Package simple_webp parses and edits WebP (RIFF) containers: it reads the
 // RIFF header and every chunk, decodes the container-level chunks (VP8X, VP8,
 // VP8L, ALPH, ANIM, ANMF, ICCP, EXIF, XMP), and supports adding or removing
 // metadata chunks and writing the stream back in its original order without
-// re-encoding the pixels.
+// re-encoding the pixels. It is pure Go — no cgo, no libwebp — and the
+// WebAssembly (WASM) decoder front end for the browser and Node.js lives in
+// the wasm subpackage.
 package simple_webp
 
 import (

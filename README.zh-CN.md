@@ -36,6 +36,8 @@ if err := webp.Encode(&out, img, &webp.EncodeOptions{}); err != nil { // lossles
   元数据只是搬运、绝不重编码图像数据。
 - **编解码完整**：VP8 / VP8L / ALPH / 动画解码，外加带 loop filter、目标体积码率控制、
   逐段量化、color transform、color cache、meta-Huffman 分组与动画输出的编码器。
+- **WebAssembly（WASM）**：同一套解码器编译成 WASM，浏览器与 Node.js 都能用——
+  把 WebP 解成 `<canvas>` 可用的 RGBA，不需要 libwebp、不需要 cgo（`wasm/`）。
 - **需要时可严格**：`ParseOptions.Strict` 校验容器规范的 MUST（chunk 顺序、VP8X 必须最前、
   保留位、画布与帧矩形、标志与实际数据一致）；默认仍宽松。
 
@@ -257,6 +259,28 @@ func (c *myChunk) Parse(chunk *simple_webp.RawChunk) error { c.Data = chunk.Data
 
 ---
 
+## WebAssembly（WASM）：在浏览器与 Node.js 里解码 WebP
+
+`wasm/` 是**仅解码**的 WebAssembly（WASM）构建：浏览器与 Node.js 里的 WebP 解码器，
+把 WebP 字节流转成 `<canvas>` 可用的 RGBA 像素，不需要 libwebp、不需要 cgo，
+也不重编码，编码不在范围内。
+
+- 构建：`wasm/build.ps1`（Windows）/ `wasm/build.sh`；产物为
+  `wasm/example/main.wasm` 与复制好的 `wasm_exec.js`。
+- JS API（由 `wasm.Register()` 安装到全局对象）：
+  - `webpDecode(bytes) -> { width, height, hasAlpha, hasAnimation, rgba }`
+    （失败返回 `{ error }`；动画取第一帧）
+  - `webpDecodeFrames(bytes) -> [ { width, height, duration, rgba }, … ]`
+    （全部动画帧，按画布尺寸；静态图返回一帧）
+  - `webpInfo(bytes) -> { width, height, hasAlpha, hasAnimation, hasICC,
+    hasEXIF, hasXMP, frameCount }`（不解码像素；VP8X 标志位 + 帧数）
+  - `bytes` 可传 `Uint8Array` 或 `ArrayBuffer`；`rgba` 为直通 alpha 的
+    `Uint8Array`，须同步消费（Go 托管内存）。
+- 解码覆盖完整扩展格式：VP8X alpha（无损与有损 `VP8X+ALPH`）、动画（`VP8X+ANIM+ANMF`），
+  以及 ICC/EXIF/XMP 元数据标志。完整示例：`wasm/example/index.html` 与 `wasm/README.md`。
+
+---
+
 ## 目录结构
 
 ```
@@ -413,27 +437,6 @@ libwebp `WebPIDecoder` 那样「边追加边解码」的增量接口，也没有
 ```go
 img, err := w.ToImageWith(simple_webp.DecodeOptions{MaxPixels: 4096 * 4096})
 ```
-
----
-
-## WebAssembly（只读解码）
-
-`wasm/` 提供 WebAssembly **仅解码**前端：把 WebP 字节流转成 RGBA 像素，
-可直接画到 `<canvas>` 上——不重编码、不做写入，编码不在范围内。
-
-- 构建：`wasm/build.ps1`（Windows）/ `wasm/build.sh`；产物为
-  `wasm/example/main.wasm` 与复制好的 `wasm_exec.js`。
-- JS API（由 `wasm.Register()` 安装到全局对象）：
-  - `webpDecode(bytes) -> { width, height, hasAlpha, hasAnimation, rgba }`
-    （失败返回 `{ error }`；动画取第一帧）
-  - `webpDecodeFrames(bytes) -> [ { width, height, duration, rgba }, … ]`
-    （全部动画帧，按画布尺寸；静态图返回一帧）
-  - `webpInfo(bytes) -> { width, height, hasAlpha, hasAnimation, hasICC,
-    hasEXIF, hasXMP, frameCount }`（不解码像素；VP8X 标志位 + 帧数）
-  - `bytes` 可传 `Uint8Array` 或 `ArrayBuffer`；`rgba` 为直通 alpha 的
-    `Uint8Array`，须同步消费（Go 托管内存）。
-- 解码覆盖完整扩展格式：VP8X alpha（无损与有损 `VP8X+ALPH`）、动画（`VP8X+ANIM+ANMF`），
-  以及 ICC/EXIF/XMP 元数据标志。完整示例：`wasm/example/index.html` 与 `wasm/README.md`。
 
 ---
 

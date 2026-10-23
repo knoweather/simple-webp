@@ -1,8 +1,8 @@
-# simple-webp · WebAssembly decoder (read only)
+# simple-webp · WebAssembly (WASM) WebP decoder
 
-A small WebAssembly module that decodes WebP into RGBA pixels **in the
-browser**, with zero C dependencies and no pixel re-encoding. Encoding is
-intentionally out of scope — this is a decoder only.
+A small WebAssembly (WASM) module that decodes **WebP** into RGBA pixels in the
+**browser** and in **Node.js**, with no libwebp, no cgo and no pixel
+re-encoding. Encoding is intentionally out of scope — this is a decoder only.
 
 ## Build
 
