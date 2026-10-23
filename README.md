@@ -1,15 +1,43 @@
 # simple-webp
 
-> [!NOTE]
-> 🚀 **Initial release, canary testing in progress.** If you hit any problem, please open an [issue](https://github.com/knoweather/simple-webp/issues)!
+Pure-Go **WebP decode + encode** — VP8 lossy, VP8L lossless, ALPH, animation.
+No cgo, no libwebp: the codec is written from scratch and returns standard
+`image.Image` (registered with `image.RegisterFormat`), and the only third-party
+module is `github.com/pkg/errors` for error wrapping.
+
+<p>
+<a href="https://pkg.go.dev/github.com/knoweather/simple-webp"><img src="https://pkg.go.dev/badge/github.com/knoweather/simple-webp.svg" alt="Go Reference"></a>
+<a href="go.mod"><img src="https://img.shields.io/badge/go-1.27%2B-00ADD8?logo=go" alt="Go 1.27+"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"></a>
+</p>
 
 **English** | [简体中文](./README.zh-CN.md)
 
-Pure-Go WebP parse / decode / encode — no cgo. Everything is written from
-scratch and returns standard `image.Image`; the only third-party module is
-`github.com/pkg/errors` (used for error wrapping). Container parsing, VP8 lossy decoding, VP8L lossless
-decoding+encoding, ALPH transparency, animation compositing — all implemented
-from scratch, returning standard `image.Image`.
+```go
+img, err := webp.Decode(r)          // VP8 lossy, VP8L lossless, ALPH
+if err != nil {
+    return err
+}
+
+var out bytes.Buffer
+if err := webp.Encode(&out, img, &webp.EncodeOptions{}); err != nil { // lossless
+    return err
+}
+// lossy instead: webp.EncodeLossy(&out, img, &webp.LossyOptions{Quality: 75})
+```
+
+- **Byte-exact rewriting**: parse → edit (`SetImage` / `AddFrame` / `AddRawChunk` /
+  `DeleteRawChunk`) → write; unknown chunks and untouched pixels survive unchanged,
+  metadata chunks (ICCP/EXIF/XMP) are carried through and never re-encoded.
+- **Complete codec**: VP8/VP8L/ALPH/animation decoding plus an encoder with loop
+  filter, target-size rate control, color transform, color cache, meta-Huffman
+  groups and animation output.
+- **Strict when you want it**: `ParseOptions.Strict` enforces the container spec's
+  MUST rules (chunk order, VP8X first, reserved bits, canvas and frame geometry,
+  flags matching the payload); the default stays lenient.
+
+> [!NOTE]
+> 🚀 **Initial release, canary testing in progress.** If you hit any problem, please open an [issue](https://github.com/knoweather/simple-webp/issues)!
 
 `webpDecoder` mirrors the architecture of
 [simple-png](https://github.com/knoweather/simple-png): chunked, raw bytes
@@ -25,7 +53,7 @@ preserved, byte-exact write back.
 | VP8 lossy decode | ✅ | bool decoder, keyframe header, partitions, coefficient trees, 16x16/8x8/4x4 prediction, WHT+IDCT, loop filter |
 | ALPH transparency | ✅ | uncompressed (3 row filters) and VP8L-compressed alpha |
 | Animation | ✅ | `ANIM`/`ANMF`, dispose/blend compositing, canvas-sized frame sequence, `FrameAt` decodes one frame without cloning the others |
-| image interface | ✅ | `ToImage()`, `*Webp` implements `image.Image`, `image.RegisterFormat("webp", ...)`, `PixelFormatYCbCr` for lossy stills |
+| image interface | ✅ | `ToImage()`, `*Webp` implements `image.Image`, `image.RegisterFormat("webp", ...)`, `PixelFormatYCbCr` for lossy stills, `DecodeWebp` decodes straight from an `io.Reader`, `DecodeInto` reuses a caller buffer |
 | Metadata editing | ✅ | rewrite with `ICCP`/`EXIF`/`XMP ` chunks, **pixels never re-encoded**, byte-exact when untouched; new chunks land where the spec puts their type |
 | Container editing | ✅ | `NewWebp` + `SetImage` build a file from scratch, `AddFrame`/`RemoveFrame` edit animations, `DeleteRawChunk` removes consumed chunks, `InvalidateCache` drops the decode cache |
 | VP8L lossless encode | ✅ | color-indexing / subtract-green / predictor / **color transform** / **color cache** / **meta-Huffman groups** / LZ77 / Huffman (≤15 bits); the cheaper of the variants is kept |
@@ -344,6 +372,15 @@ matching `cwebp -q`. On a smooth 320×240 test image the same quality setting no
 reaches about 1.5–3.7 dB more PSNR than the old linear rule did; both paths meet
 at quality 100.
 
+`LossyOptions.Segment` adds per-segment quantization on top: the frame is split
+into four segments by macroblock activity and the flat side is quantised one or
+two steps coarser while busy regions keep the base step. The encoder races the
+unsegmented, regular-step and double-step plans and keeps the smallest stream,
+so the option can only shrink a file, never grow it. The gain is content
+dependent — flat regions are skipped outright by this encoder and gain nothing,
+so the win shows on low amplitude texture (about 5 % on the noise fixture,
+nothing on pure gradients).
+
 | # | Item | Where it stands | Plan |
 |---|---|---|---|
 | 1 | **Cost model for token probability updates** | `adaptTokenProb` uses a flat 12 bit gain threshold and never looks at `tokenUpdateProb`. About 40 % of the table entries carry an update probability of 255, which RFC 6386 §13.5 marks as "never updated"; signalling those costs ~16 bits, not the ~9 the model assumes, so an update can end up making the stream larger | Price the signalling per entry, as libwebp does in `enc/frame_enc.c` |
@@ -354,17 +391,18 @@ at quality 100.
 | 6 | **VP8L colour indexing alpha** | The spec sets every alpha of the index image to 255; the encoder writes 0. Decoding is unaffected because the inverse transform substitutes the whole pixel | Write 255 |
 | 7 | **Duplicate VP8L transforms** | The spec allows each transform type once; the decoder accepts repeats, libwebp rejects them as corrupt | Reject duplicate transform types while decoding |
 | 8 | **VP8L two dimensional distance codes** | The decoder implements the full 120 entry neighbourhood map, but the encoder always writes a plain linear distance: a one pixel distance costs ~10 bits where a neighbourhood code costs 1. This is the largest single source of the remaining lossless size gap | Add `DistanceToPlaneCode` and the lookup table to the encoder, as in libwebp's `src/enc/vp8l_enc.c` |
-| 9 | **Per-segment quantization** | The quantiser index is still fixed for the whole frame, so a complex region and a flat one share the same step. The decoder already supports per-segment quantiser and filter-strength deltas, so only the encoder side is missing | Wire the macroblock activity into the per-segment deltas, as `cwebp -segments` does |
-| 10 | **More Huffman groups and better clustering** | The meta prefix codes use two groups; libwebp clusters into more groups and also handles the mixed photo/text case that way | Cluster into more groups |
-| 11 | **Animation frame differencing** | Every animation frame is encoded in full: there is no frame rectangle cropping and no inter-frame differencing | Add differencing and minimisation, as in libwebp's `WebPAnimEncoder` |
-| 12 | **Multi-token partitions** | The frame still uses a single residual partition, which limits decoder parallelism but not size | Emit more than one partition |
+| 9 | **More Huffman groups and better clustering** | The meta prefix codes use two groups; libwebp clusters into more groups and also handles the mixed photo/text case that way | Cluster into more groups |
+| 10 | **Animation frame differencing** | Every animation frame is encoded in full: there is no frame rectangle cropping and no inter-frame differencing | Add differencing and minimisation, as in libwebp's `WebPAnimEncoder` |
+| 11 | **Multi-token partitions** | The frame still uses a single residual partition, which limits decoder parallelism but not size | Emit more than one partition |
 
 A few further libwebp capabilities are private to it and are not part of the
 WebP bitstream, so the spec does not ask for them: `-near_lossless` source
 pre-filtering, `-alpha_q` lossy alpha, `-sns` spatial noise shaping, `-pass`
-multi-pass optimisation, `-partition_limit` and `-mt` multi-threading. The
-library also has no incremental/streaming decode API yet (libwebp's
-`WebPIDecoder`).
+multi-pass optimisation, `-partition_limit` and `-mt` multi-threading. On the
+decode side the library streams the container from any `io.Reader`
+(`DecodeWebp`) and can decode into a caller buffer (`DecodeInto`), but it has
+no append-driven incremental decoder (libwebp's `WebPIDecoder`) and no scaled
+or cropped decode yet.
 
 ## Safety / pixel budget
 
