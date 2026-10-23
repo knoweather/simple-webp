@@ -35,12 +35,22 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 // The image payload (VP8 / VP8L / ALPH) is never re-encoded, so editing the
 // metadata chunks does not touch the pixels at all.
 //
+// An ICCP/EXIF/XMP/ALPH/ANIM assigned to its struct is written even when the
+// original file had none; combinations that would produce an invalid stream
+// (an ALPH next to a VP8L, an ANIM without frames, an odd frame position, a
+// duration beyond 24 bits) are errors instead of a file whose meaning quietly
+// changed.
+//
 // WriteTo 把当前状态的 webp 流写出，实现 io.WriterTo。解析时被消费（consumed）的 chunk
 // 会从解析结构体重新序列化，因此对结构体的修改、以及通过 AddRawChunk / DeleteRawChunk
 // 增删的 chunk 都会反映到输出；未被消费、保持原始形态的 chunk 则逐字节原样拷贝。
 // 不做任何修改地解析再写回，可逐字节复现原文件。
 //
 // 图像载荷（VP8 / VP8L / ALPH）永远不会被重新编码，因此编辑元数据 chunk 完全不触及像素数据。
+//
+// 直接赋值给结构体的 ICCP/EXIF/XMP/ALPH/ANIM 即使原文件没有也会被写出；会
+// 产出非法流的组合（ALPH 配 VP8L、没有帧的 ANIM、奇数帧坐标、超出 24 位的
+// 时长）返回错误，而不是写出一个语义被悄悄改变的文件。
 func (w *Webp) WriteTo(out io.Writer) (int64, error) {
 	if w.origChunks == nil {
 		return 0, errors.New("webp is not parsed")
@@ -71,12 +81,19 @@ func (w *Webp) WriteTo(out io.Writer) (int64, error) {
 		payloads = append(payloads, data)
 	}
 
-	// 修正扩展特性 chunk 的序列化：直接赋值的 ICCP/EXIF/XMP 即使原文件没有
-	// 也要写出，并在存在扩展特性时保证有一个标志位正确的 VP8X。
-	// Fix extended-feature serialization: directly assigned ICCP/EXIF/XMP must
-	// be written even when the original file had none, and a correctly flagged
-	// VP8X is guaranteed whenever an extended feature is present.
-	names, payloads = w.finalizeWrite(names, payloads)
+	// 修正扩展特性 chunk 的序列化：直接赋值的 ICCP/EXIF/XMP/ALPH/ANIM 即使原
+	// 文件没有也要写出，并在存在扩展特性时保证有一个标志位正确的 VP8X；
+	// 会产出非法流的组合（ALPH 配 VP8L、没有帧的 ANIM）直接报错。
+	// Fix extended-feature serialization: directly assigned ICCP/EXIF/XMP/ALPH/
+	// ANIM must be written even when the original file had none, and a
+	// correctly flagged VP8X is guaranteed whenever an extended feature is
+	// present; combinations that would produce an invalid stream (ALPH next to
+	// VP8L, an ANIM without frames) are errors.
+	var err error
+	names, payloads, err = w.finalizeWrite(names, payloads)
+	if err != nil {
+		return 0, err
+	}
 
 	// the RIFF size field counts everything after it: the "WEBP" tag and all
 	// chunks with their headers and padding
@@ -150,7 +167,7 @@ func (w *Webp) emitConsumed(c *riffChunk, anmfIdx *int) ([]byte, error) {
 		}
 		frame := w.ANMFs[*anmfIdx]
 		*anmfIdx++
-		return frame.data(), nil
+		return frame.data()
 
 	case ICCPChunk:
 		if w.ICCP == nil {
@@ -188,37 +205,44 @@ func (w *Webp) MarshalBytes() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// finalizeWrite 修正扩展特性 chunk 的序列化，解决三个真实使用痛点：
+// finalizeWrite 修正扩展特性 chunk 的序列化，解决四个真实使用痛点：
 //
-//  1. 直接给 w.ICCP / w.EXIF / w.XMP 赋值（原文件并不含对应 chunk）时，写回
-//     会丢失这些数据——WriteTo 只遍历解析时已有的 origChunks，新赋的结构体
-//     永远不会被 emitConsumed 命中。本函数把这类结构体补写成 chunk。
-//  2. 纯 VP8L（或任何不含 VP8X）的文件在补加 metadata 时必须先有一个 VP8X
-//     chunk 并置上对应标志位（ICCP/EXIF/XMP 都只能藏在 VP8X 之后，且依赖其
-//     标志位被读取器索引）。本函数在缺 VP8X 时自动创建，并以当前状态置位。
+//  1. 直接给 w.ICCP / w.EXIF / w.XMP / w.ALPH / w.ANIM 赋值（原文件并不含
+//     对应 chunk）时，写回会丢失这些数据——WriteTo 只遍历解析时已有的
+//     origChunks，新赋的结构体永远不会被 emitConsumed 命中。本函数把这类
+//     结构体补写成 chunk。
+//  2. 纯 VP8L（或任何不含 VP8X）的文件在补加扩展特性时必须先有一个 VP8X
+//     chunk 并置上对应标志位（ICCP/EXIF/XMP/ALPH/ANIM 都只能藏在 VP8X 之后，
+//     且依赖其标志位被读取器索引）。本函数在缺 VP8X 时自动创建，并以当前
+//     状态置位。
 //  3. 补写的 chunk 按类型排位决定插入点（见 chunkInsertRank）：VP8X 最前，
-//     ICCP 紧随 VP8X 且排在 ANIM/ANMF/图像数据之前，EXIF 与 XMP 落在图像
-//     数据之后的尾部。
+//     ICCP 紧随 VP8X 且排在 ANIM/ANMF/图像数据之前，ALPH 在位流之前，EXIF
+//     与 XMP 落在图像数据之后的尾部。
+//  4. 会产出非法流的组合直接返回错误，而不是写出一个语义被悄悄改变的文件：
+//     VP8L 旁补 ALPH、没有帧时补 ANIM。
 //
 // 标志位处理是「只置位、不清除」：仅把确实存在的扩展特性对应的位打开，绝不
 // 关闭原本合法的标志位，从而不影响未做修改的流。删除 metadata 时由
 // DeleteRawChunk 负责清除对应标志位。
 //
 // finalizeWrite fixes the serialization of extended-feature chunks, addressing
-// three real pain points: (1) a directly assigned w.ICCP/w.EXIF/w.XMP that the
-// original file did not contain was silently dropped by WriteTo, which only
-// walks the chunks parsed from the source; this function writes those structs
-// back. (2) a file without a VP8X chunk (e.g. a plain VP8L) must gain a VP8X
-// with the right flag bits before metadata can be embedded — ICCP/EXIF/XMP live
-// only after VP8X and are indexed through its flags. This function creates a
-// VP8X when missing and sets its flags from the current state. Flag handling is
-// "set, never clear": it only turns on bits for features that are truly present,
-// so it never disturbs a previously valid stream. DeleteRawChunk clears the bits
-// when metadata is removed. (3) a synthesized chunk goes to the position its
-// type dictates (see chunkInsertRank): VP8X first, ICCP right after VP8X and
-// before ANIM/ANMF and the image data, EXIF and XMP after the image data at the
-// end.
-func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]byte) {
+// four real pain points: (1) a directly assigned w.ICCP/w.EXIF/w.XMP/w.ALPH/
+// w.ANIM that the original file did not contain was silently dropped by
+// WriteTo, which only walks the chunks parsed from the source; this function
+// writes those structs back. (2) a file without a VP8X chunk (e.g. a plain
+// VP8L) must gain a VP8X with the right flag bits before an extended feature
+// can be embedded — ICCP/EXIF/XMP/ALPH/ANIM live only after VP8X and are
+// indexed through its flags. This function creates a VP8X when missing and
+// sets its flags from the current state. Flag handling is "set, never clear":
+// it only turns on bits for features that are truly present, so it never
+// disturbs a previously valid stream. DeleteRawChunk clears the bits when
+// metadata is removed. (3) a synthesized chunk goes to the position its type
+// dictates (see chunkInsertRank): VP8X first, ICCP right after VP8X and before
+// ANIM/ANMF and the image data, ALPH before the bitstream, EXIF and XMP after
+// the image data at the end. (4) a combination that would produce an invalid
+// stream is an error rather than a file whose meaning quietly changed: an ALPH
+// synthesized next to a VP8L, an ANIM synthesized without frames.
+func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]byte, error) {
 	present := make(map[FourCC]bool, len(names))
 	for _, n := range names {
 		present[n] = true
@@ -231,10 +255,15 @@ func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]b
 	// anew get their flag bits set.
 
 	// 计算需要新写入的扩展 chunk（结构体已赋值，但输出里还没有对应 chunk）。
+	// ALPH 与 ANIM 同等对待：赋值了就必须写出，否则「赋值的结构体要写出」
+	// 这条承诺对它们不成立（F-01 只修了标志位，没有修写出）。
 	// Compute the extended chunks to synthesize (struct assigned but no chunk yet).
+	// ALPH and ANIM are treated the same way: an assigned struct has to be
+	// written, otherwise the promise that assigned structs get serialized does
+	// not hold for them (F-01 only fixed the flags, not the writing).
 	var synth []FourCC
 	var newFlags uint8
-	for _, name := range []FourCC{ICCPChunk, EXIFChunk, XMPChunk} {
+	for _, name := range []FourCC{ICCPChunk, EXIFChunk, XMPChunk, ALPHChunk, ANIMChunk} {
 		if present[name] {
 			continue
 		}
@@ -253,6 +282,30 @@ func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]b
 			if w.XMP != nil {
 				synth = append(synth, name)
 				newFlags |= FlagXMP
+			}
+		case ALPHChunk:
+			// VP8L 自带 alpha，规范不允许它再带 ALPH；与其写出一个自家
+			// 严格模式都拒的文件，不如直接报错。
+			// VP8L carries its own alpha and the spec forbids an extra ALPH;
+			// erroring beats writing a file this library's own strict mode
+			// rejects.
+			if w.ALPH != nil {
+				if w.VP8L != nil {
+					return nil, nil, errors.New("webp: an ALPH chunk cannot be added next to a VP8L bitstream")
+				}
+				synth = append(synth, name)
+				newFlags |= FlagAlpha
+			}
+		case ANIMChunk:
+			// 没有帧的 ANIM 是非法流（解析时就会被拒），不允许合成。
+			// An ANIM without frames is an invalid stream (the parser rejects
+			// it), so it is never synthesized.
+			if w.ANIM != nil {
+				if len(w.ANMFs) == 0 {
+					return nil, nil, errors.New("webp: an ANIM chunk needs at least one frame")
+				}
+				synth = append(synth, name)
+				newFlags |= FlagAnimation
 			}
 		}
 	}
@@ -321,7 +374,7 @@ func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]b
 		synth = append([]FourCC{VP8XChunk}, synth...)
 	}
 	if len(synth) == 0 {
-		return names, payloads
+		return names, payloads, nil
 	}
 
 	// 构造合成 chunk 的载荷。
@@ -337,6 +390,10 @@ func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]b
 			synthData[i] = w.EXIF.Data
 		case XMPChunk:
 			synthData[i] = w.XMP.Data
+		case ALPHChunk:
+			synthData[i] = append([]byte{w.ALPH.header()}, w.ALPH.Data...)
+		case ANIMChunk:
+			synthData[i] = w.ANIM.data()
 		}
 	}
 
@@ -354,5 +411,5 @@ func (w *Webp) finalizeWrite(names []FourCC, payloads [][]byte) ([]FourCC, [][]b
 		copy(payloads[idx+1:], payloads[idx:])
 		payloads[idx] = synthData[i]
 	}
-	return names, payloads
+	return names, payloads, nil
 }

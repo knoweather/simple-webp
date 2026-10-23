@@ -535,13 +535,35 @@ func (a *ANMF) Parse(c *RawChunk) error {
 // 的原始顺序逐个写出，未知类型与对应结构体为 nil 的子 chunk 用原始载荷原样写回；
 // 原始流里没有、但已被赋值的新结构体（例如解析后补上的 ALPH）追加在最后，顺序为
 // ALPH、VP8L、VP8——未经 Parse 的手工构造帧同样走这条固定顺序。
+//
+// 帧头的每个字段都有格式上限，超出就无法表示：坐标以 x/2 存储且为奇数时
+// 会静默丢位、时长与宽高是 24 位字段。这些情况一律返回错误，而不是悄悄
+// 写出一个语义被改变的文件。
+//
 // data re-serializes the frame: the 16-byte header followed by the sub-chunks.
 // A parsed frame is written in the order recorded in subs, with unknown types and
 // sub-chunks whose struct is nil emitted from their original payload; a struct
 // assigned after parsing (an ALPH added later, for instance) has no place in the
 // original stream, so it is appended in the fixed order ALPH, VP8L, VP8 — the
 // same order a manually built frame without subs is written in.
-func (a *ANMF) data() []byte {
+//
+// Every field of the frame header has a format limit beyond which it cannot be
+// represented: the position is stored as x/2 so an odd value would lose a bit
+// silently, and the duration and the dimensions are 24 bit fields. Those cases
+// are errors rather than a file whose meaning quietly changed.
+func (a *ANMF) data() ([]byte, error) {
+	if a.X < 0 || a.Y < 0 || a.X%2 != 0 || a.Y%2 != 0 {
+		return nil, errors.Errorf("webp: frame position %d,%d must be even and non-negative", a.X, a.Y)
+	}
+	if a.X >= 1<<25 || a.Y >= 1<<25 {
+		return nil, errors.Errorf("webp: frame position %d,%d out of range", a.X, a.Y)
+	}
+	if a.Width <= 0 || a.Height <= 0 || a.Width > 1<<24 || a.Height > 1<<24 {
+		return nil, errors.Errorf("webp: frame size %dx%d out of range", a.Width, a.Height)
+	}
+	if a.Duration < 0 || a.Duration >= 1<<24 {
+		return nil, errors.Errorf("webp: frame duration %d out of range 0..%d", a.Duration, 1<<24-1)
+	}
 	out := make([]byte, 16, 16+64)
 	writeUint24(out[0:3], uint32(a.X/2))
 	writeUint24(out[3:6], uint32(a.Y/2))
@@ -585,7 +607,7 @@ func (a *ANMF) data() []byte {
 	if a.VP8 != nil && !sawVP8 {
 		out = append(out, marshalRiffChunk(VP8Chunk, a.VP8.Data)...)
 	}
-	return out
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

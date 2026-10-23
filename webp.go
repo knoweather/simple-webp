@@ -673,12 +673,29 @@ func chunkInsertIndex(names []FourCC, r int) int {
 	return len(names)
 }
 
+// chunkPresent 报告流里是否仍有一个未被删除的指定类型 chunk。
+//
+// chunkPresent reports whether the stream still holds a chunk of the given
+// type that has not been deleted.
+func (w *Webp) chunkPresent(name FourCC) bool {
+	for i, c := range w.origChunks {
+		if !w.origDeleted[i] && c.name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // AddRawChunk 把一个新的原始 chunk 按类型排位插入流中：跳过所有排位不大于
 // 自身的已有 chunk，即 VP8X 最前，ICCP 在 VP8X 之后、ANIM/ANMF/图像数据之前，
 // ANIM 在第一个 ANMF 之前，ALPH 在 ANIM/ANMF 之后、VP8/VP8L 之前，VP8/VP8L
 // 之后是 EXIF、XMP 等尾部 chunk；排位 6 一律追加到末尾。可用于给已解析的文件
 // 补充 EXIF 或 XMP 等 chunk。name 必须是合法 FourCC，data 不得超过
 // maxChunkSize，且 Webp 必须来自成功的 ParseWebp。
+//
+// 单实例 chunk（VP8X/VP8/VP8L/ALPH/ANIM/ICCP/EXIF/XMP）在流中已存在时拒绝
+// 重复插入——两份会让文件非法；ANMF 可以追加，但载荷必须是一帧合法的帧
+// （手工构造帧请用 AddFrame）。
 //
 // AddRawChunk inserts a new raw chunk at the position its type dictates: it
 // skips every existing chunk whose rank is not greater than its own, so VP8X
@@ -687,6 +704,11 @@ func chunkInsertIndex(names []FourCC, r int) int {
 // and EXIF, XMP or unknown types land at the end. Use it e.g. to add an EXIF or
 // XMP chunk to an already parsed file. name must be a valid FourCC, data must
 // fit in maxChunkSize and the Webp must come from a successful ParseWebp.
+//
+// A single-instance chunk (VP8X/VP8/VP8L/ALPH/ANIM/ICCP/EXIF/XMP) that is
+// already present is refused, because a second copy makes the file invalid; an
+// ANMF may be appended, but its payload has to be a valid frame (use AddFrame
+// to build one).
 func (w *Webp) AddRawChunk(name FourCC, data []byte) error {
 	if !validFourCC(name) {
 		return errors.Errorf("invalid chunk type %q", string(name))
@@ -696,6 +718,52 @@ func (w *Webp) AddRawChunk(name FourCC, data []byte) error {
 	}
 	if w.origChunks == nil {
 		return errors.New("webp is not parsed")
+	}
+	// 单实例 chunk 重复插入会产出非法流（两个图像数据块、两个 ICCP……），
+	// 这里直接拒绝；结构可以廉价校验的类型顺带校验载荷长度，避免写进一个
+	// 解析不回来的 chunk。图像码流与元数据的内容不在这里校验（那需要跑
+	// 解码器），调用方负责给合法载荷。
+	// A duplicate of a single-instance chunk would produce an invalid stream
+	// (two image data chunks, two ICCP chunks, ...), so it is refused; the
+	// types whose structure is cheap to check also get a payload length check,
+	// so a chunk that would not parse back is refused up front. The content of
+	// the image bitstreams and of the metadata is not validated here (that
+	// would need a decoder); the caller supplies valid payloads.
+	switch name {
+	case VP8XChunk, VP8Chunk, VP8LChunk, ALPHChunk, ANIMChunk, ICCPChunk, EXIFChunk, XMPChunk:
+		if w.chunkPresent(name) {
+			return errors.Errorf("webp: a %q chunk is already present", string(name))
+		}
+		// VP8L 自带 alpha，再挂 ALPH 是非法组合；VP8 与 VP8L 也只能有一个。
+		// A VP8L carries its own alpha, so an extra ALPH is invalid; VP8 and
+		// VP8L are mutually exclusive as well.
+		switch {
+		case name == ALPHChunk && (w.VP8L != nil || w.chunkPresent(VP8LChunk)):
+			return errors.New("webp: an ALPH chunk cannot be added next to a VP8L bitstream")
+		case name == VP8Chunk && (w.VP8L != nil || w.chunkPresent(VP8LChunk)):
+			return errors.New("webp: a VP8 chunk cannot be added next to a VP8L bitstream")
+		case name == VP8LChunk && (w.VP8 != nil || w.chunkPresent(VP8Chunk)):
+			return errors.New("webp: a VP8L chunk cannot be added next to a VP8 bitstream")
+		}
+		switch name {
+		case VP8XChunk:
+			if len(data) != 10 {
+				return errors.Errorf("webp: a VP8X payload is 10 bytes, got %d", len(data))
+			}
+		case ANIMChunk:
+			if len(data) != 6 {
+				return errors.Errorf("webp: an ANIM payload is 6 bytes, got %d", len(data))
+			}
+		case ALPHChunk:
+			if len(data) == 0 {
+				return errors.New("webp: an ALPH payload needs its flag byte")
+			}
+		}
+	case ANMFChunk:
+		frame := ANMF{maxChunkSize: w.maxChunkSize}
+		if err := frame.Parse(&RawChunk{Name: name, Data: data}); err != nil {
+			return errors.Wrapf(err, "webp: the %q payload is not a valid frame (use AddFrame instead)", string(name))
+		}
 	}
 	c := &riffChunk{name: name, data: data}
 	names := make([]FourCC, len(w.origChunks))
