@@ -73,12 +73,31 @@ func ycbcrToNRGBA(src *image.YCbCr) *image.NRGBA {
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	ycbcrToNRGBAInto(dst, src)
+	return dst
+}
+
+// ycbcrToNRGBAInto 把 4:2:0 帧转换进调用方提供的 NRGBA 缓冲；dst 的边界必须
+// 与 src 的尺寸一致。除目标缓冲外不分配图像内存，供 DecodeInto 复用调用方
+// 的缓冲。
+//
+// ycbcrToNRGBAInto converts a 4:2:0 frame into an NRGBA buffer supplied by the
+// caller; the bounds of dst must match the size of src. Apart from the scratch
+// rows no image memory is allocated, which lets DecodeInto reuse the caller's
+// buffer.
+func ycbcrToNRGBAInto(dst *image.NRGBA, src *image.YCbCr) {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	db := dst.Bounds()
+	if db.Dx() != w || db.Dy() != h {
+		return
+	}
 	cw, ch := (w+1)/2, (h+1)/2
 	if h <= 32 {
 		// 串行路径：两行色度暂存即可。
 		// Serial path: two chroma scratch rows are enough.
 		decodeBand(dst, src, cw, ch, w, 0, h, make([]byte, 2*w), func() {})
-		return dst
+		return
 	}
 	const bandH = 16
 	bands := (h + bandH - 1) / bandH
@@ -96,7 +115,6 @@ func ycbcrToNRGBA(src *image.YCbCr) *image.NRGBA {
 		go decodeBand(dst, src, cw, ch, w, y0, y1, rows[i*2*w:(i+1)*2*w], wg.Done)
 	}
 	wg.Wait()
-	return dst
 }
 
 // decodeBand 把 src 的行区间 [y0, y1) 转换进 dst。各带的目标行互不重叠、

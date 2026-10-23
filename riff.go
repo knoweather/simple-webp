@@ -75,12 +75,18 @@ func validFourCC(name FourCC) bool {
 }
 
 // readRiffChunk reads one chunk: fourcc, uint32 payload size, payload and the
-// padding byte that is present when the payload size is odd.
+// padding byte that is present when the payload size is odd. A payload larger
+// than maxChunk is rejected before anything is allocated; a non-positive
+// maxChunk falls back to the default maxChunkSize.
 // It returns io.EOF when the stream ends exactly at a chunk boundary.
 //
 // readRiffChunk 读取一个 chunk：四字符码、uint32 载荷长度、载荷，以及载荷长度为奇数时
-// 存在的 1 字节填充。若流恰好结束在 chunk 边界上，则返回 io.EOF。
-func readRiffChunk(r io.Reader) (*riffChunk, error) {
+// 存在的 1 字节填充。超过 maxChunk 的载荷在分配任何内存之前就被拒绝；maxChunk 非正
+// 时回退到默认的 maxChunkSize。若流恰好结束在 chunk 边界上，则返回 io.EOF。
+func readRiffChunk(r io.Reader, maxChunk int) (*riffChunk, error) {
+	if maxChunk <= 0 {
+		maxChunk = maxChunkSize
+	}
 	var head [8]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -93,7 +99,10 @@ func readRiffChunk(r io.Reader) (*riffChunk, error) {
 		return nil, errors.Errorf("invalid webp: bad chunk type %q", string(name))
 	}
 	size := by.Uint32(head[4:8])
-	if size > maxChunkSize {
+	// 用 int64 比较，避免 MaxChunkSize 被调用方设成超过 32 位时截断。
+	// Compare as int64 so a MaxChunkSize above 32 bits set by the caller does
+	// not wrap around.
+	if int64(size) > int64(maxChunk) {
 		return nil, errors.Errorf("invalid webp: chunk %q too large: %d bytes", string(name), size)
 	}
 	// 载荷流式读入：内存只随实际到达的数据增长，声明长度再大也不会预分配。

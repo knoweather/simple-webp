@@ -17,7 +17,9 @@ func TestEncodeUses4x4Modes(t *testing.T) {
 	for _, q := range []int{40, 60, 80, 95} {
 		src := testImage(96, 72)
 		e := newEncoder(96, 72, src, q)
-		e.run()
+		if _, err := e.run(); err != nil {
+			t.Fatalf("q=%d: run: %v", q, err)
+		}
 		if e.y4Blocks == 0 {
 			t.Fatalf("q=%d: no macroblock used the 4x4 mode path", q)
 		}
@@ -44,7 +46,10 @@ func TestEncode4x4IndependentDecoder(t *testing.T) {
 	} {
 		src := testImage(tc.w, tc.h)
 		e := newEncoder(tc.w, tc.h, src, tc.quality)
-		data := e.run()
+		data, err := e.run()
+		if err != nil {
+			t.Fatalf("%dx%d q=%d: run: %v", tc.w, tc.h, tc.quality, err)
+		}
 		if e.y4Blocks == 0 {
 			t.Fatalf("%dx%d q=%d: the stream did not use the 4x4 mode path", tc.w, tc.h, tc.quality)
 		}

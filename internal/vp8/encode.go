@@ -3,17 +3,22 @@ package vp8
 import (
 	"image"
 	"math"
+
+	"github.com/pkg/errors"
 )
 
 // 帧内编码器：亮度可以用整块 16x16 模式，也可以用十六个 4x4 模式；色度用
-// 8x8 模式。量化索引固定，环路滤波关闭（滤波强度 0 时规范允许省略滤波）。
-// 模式由率失真准则选出：每个候选模式都要走一遍预测、变换与量化，再用
+// 8x8 模式。量化索引由质量按 libwebp 的曲线推出，帧头同时写出环路滤波参数
+// （强度为 0 时解码端跳过滤波）；打开分段后每个宏块按活动度取所在段的量化
+// 偏移。模式由率失真准则选出：每个候选模式都要走一遍预测、变换与量化，再用
 // 「重建失真 + 系数 × 比特数」比较。
 //
 // The intra frame encoder: luma uses either one 16x16 mode or sixteen 4x4
-// modes, chroma uses 8x8 modes. One fixed quantization index and the loop
-// filter disabled (a filter level of zero lets the decoder skip filtering
-// entirely). The modes are picked by a rate distortion criterion: every
+// modes, chroma uses 8x8 modes. The quantiser index comes from the quality
+// through libwebp's curve, and the frame header carries the loop filter
+// parameters (a level of zero lets the decoder skip filtering); with
+// segmentation on, every macroblock takes the quantiser offset of its
+// activity segment. The modes are picked by a rate distortion criterion: every
 // candidate mode goes through prediction, transform and quantization, and the
 // candidates are compared on "reconstruction distortion plus lambda times the
 // number of bits".
@@ -73,6 +78,11 @@ type encoder struct {
 	// counts tallies the zero and one decisions at every token probability
 	// entry, so the default table can be adapted to this frame's statistics.
 	counts [nPlane][nBand][nContext][nProb][2]uint32
+	// seg 是逐段量化方案；enabled 为 false 时帧头不写分段，全部宏块用段 0。
+	//
+	// seg is the per-segment quantization plan; when enabled is false the
+	// frame header carries no segmentation and every macroblock uses segment 0.
+	seg segPlan
 	// collect 为真时统计 token 的取值分布；estimating 为真时写出的比特只
 	// 计入代价而不落到码流里。
 	//
@@ -159,6 +169,16 @@ type Options struct {
 	// Sharpness is the filter sharpness, 0..7, where a larger value keeps more
 	// detail.
 	Sharpness int
+	// Segment 打开逐段量化：按宏块活动度把帧分成四段，平坦的宏块用更粗的
+	// 量化、繁忙的保持基础量化。开启后编码器会同时试一遍不分段的版本，
+	// 只保留更小的那个，因此体积不会大于关闭时。默认关闭。
+	//
+	// Segment enables per-segment quantization: the frame is split into four
+	// segments by macroblock activity, flat macroblocks getting a coarser
+	// quantizer while busy ones keep the base. With it on the encoder also
+	// tries one unsegmented pass and keeps whichever stream is smaller, so
+	// the size never grows over having it off. It is off by default.
+	Segment bool
 }
 
 // autoFilterLevel 由质量推导环路滤波强度：质量越低，量化越粗、块效应越强，
@@ -199,18 +219,79 @@ func EncodeWithOptions(src *image.YCbCr, opt Options) ([]byte, error) {
 	e.filterLevel = level
 	e.simpleFilter = opt.SimpleFilter
 	e.sharpness = clipInt(opt.Sharpness, 0, 7)
-	return e.run(), nil
+	if !opt.Segment {
+		return e.run()
+	}
+
+	// 逐段量化：按活动度制订方案，分别用「不分段」「常规步长」「双倍步长」
+	// 三个方案各编码一遍，只保留最小的那个。分段本身有成本（帧头字段加每
+	// 宏块段号），而收益只出现在「低幅值纹理」这类内容上——平坦区域多数
+	// 直接 skip，粗量化无利可图。方案不划算时竞赛保证体积不升。
+	// Per-segment quantization: the plan is derived from the activity and the
+	// frame is encoded three times — unsegmented, with the regular step and
+	// with double the step — and the smallest stream wins. Segmentation has a
+	// cost of its own (the header fields plus a segment ID per macroblock) and
+	// the gain only shows on low amplitude texture, because flat regions are
+	// mostly skipped outright and gain nothing from a coarser quantizer. The
+	// race keeps the size from growing when a plan does not pay off.
+	var best []byte
+	attempt := func(enc *encoder, plan segPlan) error {
+		enc.seg = plan
+		if plan.enabled {
+			setupSegmentQuant(&enc.d, enc.qi, plan.delta)
+		}
+		data, err := enc.run()
+		if err != nil {
+			return err
+		}
+		if best == nil || len(data) < len(best) {
+			best = data
+		}
+		return nil
+	}
+	// 第一次尝试直接复用已按选项配置好的 e，省掉一次整帧缓冲分配。
+	// The first attempt reuses e, which is already configured from the
+	// options, so one full set of frame buffers is not allocated twice.
+	if err := attempt(e, segPlan{}); err != nil {
+		return nil, err
+	}
+	base := planSegments(src, e.d.mbw, e.d.mbh, e.qi)
+	if base.enabled {
+		enc := newEncoder(w, h, src, opt.Quality)
+		enc.filterLevel = level
+		enc.simpleFilter = opt.SimpleFilter
+		enc.sharpness = e.sharpness
+		if err := attempt(enc, base); err != nil {
+			return nil, err
+		}
+		// 双倍步长：平坦侧再粗一档，只有不越出索引上限时才参与竞赛。
+		// Double the step: one more notch on the flat side, racing only when
+		// it stays inside the index range.
+		d2 := 2 * int(base.delta[2])
+		if d2 > 0 && e.qi+2*d2 <= 127 {
+			wide := base
+			wide.delta = [nSegment]int8{0, 0, int8(d2), int8(2 * d2)}
+			enc := newEncoder(w, h, src, opt.Quality)
+			enc.filterLevel = level
+			enc.simpleFilter = opt.SimpleFilter
+			enc.sharpness = e.sharpness
+			if err := attempt(enc, wide); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return best, nil
 }
 
 // EncodeToTarget 在给定选项的基础上做码率控制：在质量 0..100 之间二分，返回
-// 体积最接近 targetBytes 的那一次编码结果。码率控制只调全局量化，逐段量化
-// 尚未实现；目标无法精确命中时返回最接近的一次。
+// 体积最接近 targetBytes 的那一次编码结果。码率控制只调全局量化（若选项打开
+// 逐段量化，每次尝试内部会自行竞赛）；目标无法精确命中时返回最接近的一次。
 //
 // EncodeToTarget adds rate control on top of the given options: it bisects the
 // quality over 0..100 and returns the encode whose size is closest to
-// targetBytes. Only the global quantiser is adjusted (per-segment quantization is
-// not implemented); when the target cannot be hit exactly the closest encode is
-// returned.
+// targetBytes. Only the global quantiser is adjusted (with the segment option
+// on, every attempt races its own plans); when the target cannot be hit
+// exactly the closest encode is returned.
 func EncodeToTarget(src *image.YCbCr, opt Options, targetBytes int) ([]byte, error) {
 	if targetBytes <= 0 {
 		return nil, ErrInvalid
@@ -314,16 +395,7 @@ func newEncoder(w, h int, src *image.YCbCr, quality int) *encoder {
 
 	e.qi = quantIndex(quality)
 	e.rdScale = rdScaleDefault
-	q := e.qi
-	d.q[0].y1[0] = dequantTableDC[q]
-	d.q[0].y1[1] = dequantTableAC[q]
-	d.q[0].y2[0] = dequantTableDC[q] * 2
-	d.q[0].y2[1] = dequantTableAC[q] * 155 / 100
-	if d.q[0].y2[1] < 8 {
-		d.q[0].y2[1] = 8
-	}
-	d.q[0].uv[0] = dequantTableDC[clipInt(q, 0, 117)]
-	d.q[0].uv[1] = dequantTableAC[q]
+	setupSegmentQuant(d, e.qi, [nSegment]int8{})
 
 	e.srcY = newPlane(d.mbw*16, d.mbh*16, 4)
 	e.srcCb = newPlane(d.mbw*8, d.mbh*8, 0)
@@ -389,8 +461,11 @@ func (e *encoder) loadSource(src *image.YCbCr) {
 //
 // run encodes every macroblock and assembles the stream: the ten byte frame
 // header, the first partition (control header and macroblock modes) and the
-// single residual partition.
-func (e *encoder) run() []byte {
+// single residual partition. The 19 bit first-partition length of the frame tag
+// cannot represent more than 0x7ffff bytes, so an oversized first partition is
+// an error instead of a stream whose tag silently wraps into the neighbouring
+// fields.
+func (e *encoder) run() ([]byte, error) {
 	// 第一遍只统计每个 token 概率条目上的 0/1 次数，不产出字节；据此把默认
 	// 概率表调整成本帧自己的统计，第二遍用调整后的表真正编码。模式决策与量化
 	// 都与概率无关，所以两遍得到完全相同的系数与重建。
@@ -418,6 +493,9 @@ func (e *encoder) run() []byte {
 
 	d := &e.d
 	hdr := e.hdr.finish()
+	if err := checkFirstPartition(len(hdr)); err != nil {
+		return nil, err
+	}
 	tok := e.tok.finish()
 	out := make([]byte, 0, 10+len(hdr)+len(tok))
 	tag := uint32(1)<<4 | uint32(len(hdr))<<5
@@ -425,7 +503,28 @@ func (e *encoder) run() []byte {
 	out = append(out, byte(d.width), byte(d.width>>8), byte(d.height), byte(d.height>>8))
 	out = append(out, hdr...)
 	out = append(out, tok...)
-	return out
+	return out, nil
+}
+
+// maxFirstPartition 是帧标签里首分区长度字段能表示的最大字节数（19 位）。
+//
+// maxFirstPartition is the largest first-partition length the 19 bit field of
+// the frame tag can hold.
+const maxFirstPartition = 1<<19 - 1
+
+// checkFirstPartition 报告首分区长度是否超出帧标签的 19 位字段。超限时若
+// 照常左移，长度会溢出到标签的相邻字段，产出的码流会被解码器读成别的
+// 分区布局，所以这里直接报错。
+//
+// checkFirstPartition reports whether the first-partition length overflows the
+// 19 bit field of the frame tag. Shifting an oversized length would spill into
+// the neighbouring tag fields and a decoder would read a different partition
+// layout, so it is an error instead.
+func checkFirstPartition(n int) error {
+	if n > maxFirstPartition {
+		return errors.Wrapf(ErrTooLarge, "first partition is %d bytes, the frame tag allows %d", n, maxFirstPartition)
+	}
+	return nil
 }
 
 // encodeAll 按光栅顺序编码全部宏块。
@@ -456,6 +555,7 @@ func (e *encoder) resetReconstruction() {
 	d.cr.initBorders()
 	d.upMB = make([]mbState, d.mbw)
 	d.leftMB = mbState{}
+	d.segment = 0
 }
 
 // adaptTokenProb 依据第一遍的统计把默认概率表调整成本帧的概率表。
@@ -532,9 +632,35 @@ func (e *encoder) writeHeader() {
 	// colour space and pixel clamp flags: unused for still images.
 	h.putBit(uniformProb, false)
 	h.putBit(uniformProb, false)
-	// 不使用分段。
-	// no segmentation.
-	h.putBit(uniformProb, false)
+	// 分段：按方案写出启用、更新分段图、更新特性数据（相对增量）与逐段
+	// 量化偏移；滤波强度不随段变化；segment ID 树概率非默认时才写出。
+	// Segmentation: the plan decides the enable and map update bits, the
+	// feature data update (relative deltas) and the per-segment quantizer
+	// offsets; the filter strength stays the same for every segment and the
+	// segment ID tree probabilities are written only when they differ from
+	// the default.
+	if e.seg.enabled {
+		h.putBit(uniformProb, true)  // 启用分段 / segmentation enabled
+		h.putBit(uniformProb, true)  // 更新分段图 / the map is updated
+		h.putBit(uniformProb, true)  // 更新特性数据 / the features are updated
+		h.putBit(uniformProb, false) // 相对增量 / relative deltas
+		for i := range e.seg.delta {
+			h.putOptionalInt(uniformProb, 7, int32(e.seg.delta[i]))
+		}
+		for i := 0; i < nSegment; i++ {
+			h.putBit(uniformProb, false) // 不更新滤波强度 / no filter update
+		}
+		for i := range e.seg.prob {
+			if e.seg.prob[i] == 0xff {
+				h.putBit(uniformProb, false) // 用默认概率 / default probability
+				continue
+			}
+			h.putBit(uniformProb, true)
+			h.putUint(uniformProb, 8, uint32(e.seg.prob[i]))
+		}
+	} else {
+		h.putBit(uniformProb, false) // 不使用分段 / no segmentation
+	}
 	// 滤波：类型、强度、锐度、不做参考帧/模式偏移。
 	// filtering: type, level, sharpness, no reference or mode deltas.
 	if e.filterLevel > 0 && !e.simpleFilter {
@@ -591,6 +717,15 @@ func (e *encoder) encodeMB(mbx, mby int) {
 	bx, by := mbx*16, mby*16
 	cx, cy := mbx*8, mby*8
 
+	// 当前宏块落在哪一段由静态方案决定，两遍编码一致；后续的量化表查找
+	// 都按 d.segment 取该段的。
+	// The segment of the macroblock comes from the static plan and is the
+	// same in both passes; every quantizer lookup below takes the tables of
+	// d.segment.
+	if e.seg.enabled {
+		d.segment = int(e.seg.segOfMB[mby*d.mbw+mbx])
+	}
+
 	// 宏块最右 4x4 块的右上预测像素取自宏块上方那一行，必须在预测之前取好。
 	// The top right pixels of the rightmost 4x4 block come from the row above
 	// the macroblock, so they have to be fetched before the prediction.
@@ -630,6 +765,12 @@ func (e *encoder) encodeMB(mbx, mby int) {
 
 	skip := e.levelsAreZero()
 
+	// 段号位写在 skip 位之前，与解码器 reconstruct 的读取顺序一致。
+	// The segment ID bits precede the skip bit, the order the decoder's
+	// reconstruct reads them in.
+	if e.seg.enabled {
+		e.writeSegmentID(int(e.seg.segOfMB[mby*d.mbw+mbx]))
+	}
 	if d.useSkipProb {
 		e.hdr.putBit(d.skipProb, skip)
 	}
@@ -722,7 +863,7 @@ func (e *encoder) levelsAreZero() bool {
 // block.
 func (e *encoder) transformLuma16(bx, by int) {
 	d := &e.d
-	q := d.q[0]
+	q := d.q[d.segment]
 	var dc [16]int32
 	for n := 0; n < 16; n++ {
 		x, y := bx+(n%4)*4, by+(n/4)*4
@@ -753,7 +894,7 @@ func (e *encoder) transformLuma16(bx, by int) {
 // and the AC stay in the block, no Y2 is involved.
 func (e *encoder) transformLuma4(n, x, y int) {
 	d := &e.d
-	q := d.q[0]
+	q := d.q[d.segment]
 	var blk [16]int32
 	e.residual(d.y, e.srcY, x, y, &blk)
 	fdct4x4(&blk)
@@ -774,7 +915,7 @@ func (e *encoder) transformLuma4(n, x, y int) {
 // blocks, and every coefficient is coded.
 func (e *encoder) transformChroma(cx, cy int) {
 	d := &e.d
-	q := d.q[0]
+	q := d.q[d.segment]
 	for c := 0; c < 4; c++ {
 		x, y := cx+(c%2)*4, cy+(c/2)*4
 		var blk [16]int32
@@ -820,7 +961,7 @@ func (e *encoder) residual(pred, src *plane, x, y int, out *[16]int32) {
 // transform, which scatters the DC values into the sixteen luma blocks.
 func (e *encoder) loadCoeffsLuma16() {
 	d := &e.d
-	q := d.q[0]
+	q := d.q[d.segment]
 	for i := 0; i < 16; i++ {
 		qq := q.y2[1]
 		if i == 0 {
@@ -842,7 +983,7 @@ func (e *encoder) loadCoeffsLuma16() {
 // decoder's coefficient buffer.
 func (e *encoder) loadCoeffsLuma4(n int) {
 	d := &e.d
-	q := d.q[0]
+	q := d.q[d.segment]
 	for z := 0; z < 16; z++ {
 		qq := q.y1[1]
 		if z == 0 {
@@ -858,7 +999,7 @@ func (e *encoder) loadCoeffsLuma4(n int) {
 // buffer.
 func (e *encoder) loadCoeffsChroma() {
 	d := &e.d
-	q := d.q[0]
+	q := d.q[d.segment]
 	for c := 0; c < 4; c++ {
 		for z := 0; z < 16; z++ {
 			qq := q.uv[1]

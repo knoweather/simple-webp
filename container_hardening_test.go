@@ -505,3 +505,47 @@ func TestANMFRejectsDuplicateSubChunks(t *testing.T) {
 		}
 	}
 }
+
+// TestParseMaxChunkSize 覆盖 F-07 的残留建议：ParseOptions.MaxChunkSize 让
+// 调用方可以收紧单 chunk 载荷上限，超限的 chunk 在分配内存前就被拒绝；
+// 0 表示默认上限，嵌套在 ANMF 里的子 chunk 同样受约束。
+//
+// TestParseMaxChunkSize covers the leftover suggestion of F-07:
+// ParseOptions.MaxChunkSize lets the caller tighten the per-chunk payload cap,
+// an oversized chunk is refused before any memory is allocated for it, 0 means
+// the default cap and the sub-chunks nested inside an ANMF are bound by it too.
+func TestParseMaxChunkSize(t *testing.T) {
+	big := chunkBytes("EXIF", make([]byte, 4096))
+	stream := buildWebp(chunkBytes("VP8 ", vp8Payload(8, 8)), big)
+
+	// 上限低于载荷：拒绝，且默认路径不受影响。
+	// A cap below the payload is refused, the default path is unaffected.
+	if _, err := ParseWebpBytesWith(stream, ParseOptions{MaxChunkSize: 1024}); err == nil {
+		t.Fatal("a chunk above MaxChunkSize was accepted")
+	}
+	if _, err := ParseWebpBytesWith(stream, ParseOptions{MaxChunkSize: 0}); err != nil {
+		t.Fatalf("the default cap rejected a valid stream: %v", err)
+	}
+	if _, err := ParseWebpBytesWith(stream, ParseOptions{MaxChunkSize: 4096}); err != nil {
+		t.Fatalf("a cap at the payload size was refused: %v", err)
+	}
+
+	// ANMF 内的子 chunk 同样受上限约束。
+	// The sub-chunks inside an ANMF are bound by the cap as well.
+	frame := make([]byte, 16)
+	writeUint24(frame[6:9], 7)
+	writeUint24(frame[9:12], 7)
+	frame = append(frame, chunkBytes("VP8 ", vp8Payload(8, 8))...)
+	frame = append(frame, chunkBytes("XYZW", make([]byte, 2048))...)
+	anim := buildWebp(
+		chunkBytes("VP8X", vp8xPayload(FlagAnimation, 32, 16)),
+		chunkBytes("ANIM", make([]byte, 6)),
+		chunkBytes("ANMF", frame),
+	)
+	if _, err := ParseWebpBytesWith(anim, ParseOptions{MaxChunkSize: 1024}); err == nil {
+		t.Fatal("an oversized sub-chunk inside an ANMF was accepted")
+	}
+	if _, err := ParseWebpBytesWith(anim, ParseOptions{}); err != nil {
+		t.Fatalf("the default cap rejected a valid animation: %v", err)
+	}
+}

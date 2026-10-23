@@ -80,6 +80,13 @@ type Webp struct {
 	origConsumed []bool
 	origDeleted  []bool
 
+	// maxChunkSize 是本次解析使用的 chunk 载荷上限，来自 ParseOptions；
+	// 解析 ANMF 内的嵌套子 chunk 时同样受它约束。
+	//
+	// maxChunkSize is the chunk payload cap of this parse, taken from
+	// ParseOptions; the nested sub-chunks inside an ANMF are bound by it too.
+	maxChunkSize int
+
 	sync.RWMutex
 	sync.Once
 
@@ -128,6 +135,15 @@ type ParseOptions struct {
 	// VerifySize requires the RIFF File Size to match the actual stream length,
 	// the verifySize argument of ParseWebp.
 	VerifySize bool
+	// MaxChunkSize 限制单个 chunk 载荷的字节数，0 表示默认的 1<<30。
+	// 解析不可信输入时调小它可以更早拒绝畸形文件；载荷按流式读入，
+	// 超限的 chunk 在分配任何内存之前就被拒绝。
+	//
+	// MaxChunkSize caps the payload of a single chunk in bytes; 0 means the
+	// default 1<<30. Turn it down when parsing untrusted input to reject
+	// malformed files earlier; payloads are streamed in, so an oversized
+	// chunk is refused before any memory is allocated for it.
+	MaxChunkSize int
 }
 
 // ParseWebp 解析 WebP 流：读取 RIFF 头与全部 chunk，并解码容器级 chunk
@@ -171,9 +187,9 @@ func ParseWebpWith(r io.Reader, opt ParseOptions) (*Webp, error) {
 		src = io.LimitReader(cr, int64(declared)-4)
 	}
 
-	var w = &Webp{}
+	var w = &Webp{maxChunkSize: opt.MaxChunkSize}
 	for {
-		c, err := readRiffChunk(src)
+		c, err := readRiffChunk(src, w.maxChunkSize)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -291,7 +307,7 @@ func (w *Webp) parseOne(c *riffChunk) (bool, error) {
 		w.ANIM = &ANIM{}
 		target = w.ANIM
 	case ANMFChunk:
-		frame := &ANMF{}
+		frame := &ANMF{maxChunkSize: w.maxChunkSize}
 		if err := frame.Parse(&RawChunk{Name: c.name, Data: c.data}); err != nil {
 			return false, err
 		}

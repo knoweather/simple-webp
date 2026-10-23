@@ -29,7 +29,10 @@ func TestEncodeRealContent(t *testing.T) {
 		}
 		for _, q := range []int{40, 70, 90} {
 			e := newEncoder(src.Rect.Dx(), src.Rect.Dy(), src, q)
-			data := e.run()
+			data, err := e.run()
+			if err != nil {
+				t.Fatalf("q=%d: run: %v", q, err)
+			}
 			got, err := Decode(data)
 			if err != nil {
 				t.Fatalf("%s q=%d: decode: %v", name, q, err)

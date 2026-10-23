@@ -75,6 +75,16 @@ type LossyOptions struct {
 	// encode closest to that size wins (it covers the VP8 bitstream only, alpha
 	// and metadata are not counted). 0 encodes at Quality.
 	TargetBytes int
+	// Segment 打开逐段量化：按宏块活动度把帧分成四段，平坦区域用更粗的
+	// 量化、繁忙区域保持基础量化。编码器会同时试一遍不分段的版本并只保留
+	// 更小的，体积不会大于关闭时。默认关闭。
+	//
+	// Segment enables per-segment quantization: the frame is split into four
+	// segments by macroblock activity, flat regions getting a coarser
+	// quantizer while busy ones keep the base. The encoder also tries one
+	// unsegmented pass and keeps the smaller stream, so the size never grows
+	// over having it off. It is off by default.
+	Segment bool
 }
 
 // defaultLossyQuality 是未指定质量时使用的取值。
@@ -157,6 +167,7 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 		Quality:      quality,
 		FilterLevel:  filterLevel,
 		SimpleFilter: simpleFilter,
+		Segment:      opt != nil && opt.Segment,
 	}
 	var targetBytes int
 	if opt != nil {

@@ -303,7 +303,10 @@ func TestEncodeReconstructionMatchesDecode(t *testing.T) {
 		w, h := 64, 48
 		src := testImage(w, h)
 		e := newEncoder(w, h, src, q)
-		data := e.run()
+		data, err := e.run()
+		if err != nil {
+			t.Fatalf("%dx%d q=%d: run: %v", w, h, q, err)
+		}
 		dec, err := Decode(data)
 		if err != nil {
 			t.Fatalf("q=%d: decode: %v", q, err)

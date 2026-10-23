@@ -33,11 +33,15 @@ var y16Modes = [4]uint8{predDC, predVE, predHE, predTM}
 // y4Modes are the ten modes available to a 4x4 luma block.
 var y4Modes = [10]uint8{predDC, predTM, predVE, predHE, predRD, predVR, predLD, predVL, predHD, predHU}
 
-// rdLambda 返回率失真权衡系数。
+// rdLambda 返回率失真权衡系数。量化步长取当前宏块所在段的 AC 因子，
+// 分段量化时各段的权衡随之不同；未分段时 d.segment 恒为 0，行为不变。
 //
-// rdLambda returns the rate distortion trade-off factor.
+// rdLambda returns the rate distortion trade-off factor. The quantizer step is
+// the AC factor of the current macroblock's segment, so with segmentation
+// every segment trades at its own rate; without segmentation d.segment is
+// always 0 and the behaviour is unchanged.
 func (e *encoder) rdLambda() float64 {
-	q := float64(e.d.q[0].y1[1])
+	q := float64(e.d.q[e.d.segment].y1[1])
 	return e.rdScale * q * q
 }
 

@@ -2,6 +2,7 @@ package simple_webp
 
 import (
 	"image"
+	"io"
 
 	"github.com/pkg/errors"
 
@@ -63,6 +64,83 @@ type DecodeOptions struct {
 	//
 	// MaxPixels rejects larger images; 0 uses defaultMaxPixels.
 	MaxPixels int
+}
+
+// DecodeWebp 从任意 io.Reader 流式解析并解码一个 WebP 文件，等价于
+// ParseWebp(r) 后接 ToImageWith(opt)。容器按 chunk 逐个流入，调用方不需要
+// 事先把整个文件读进内存——文件、网络流、bytes.Reader 都可以直接喂进来。
+//
+// DecodeWebp parses and decodes a webp file from any io.Reader, the streaming
+// counterpart of ParseWebp(r) followed by ToImageWith(opt). The container
+// streams in chunk by chunk, so the caller never needs the whole file in
+// memory: files, network streams and bytes.Reader all feed straight in.
+func DecodeWebp(r io.Reader, opt DecodeOptions) (image.Image, error) {
+	w, err := ParseWebp(r)
+	if err != nil {
+		return nil, err
+	}
+	return w.ToImageWith(opt)
+}
+
+// DecodeInto 把一张静态图解到调用方提供的 NRGBA 缓冲里：除色度上采样的暂存
+// 行外不再分配图像内存，连续解码多张图时可以复用同一块缓冲。dst 的边界必须
+// 恰好是 image.Rect(0, 0, w.Width, w.Height)；尺寸不符、nil 目标或动画文件
+// 都会返回错误，dst 内容不被修改。像素预算取默认值（1<<27 个像素）。
+//
+// DecodeInto decodes one still image into an NRGBA buffer supplied by the
+// caller: apart from the chroma upsampling scratch rows no image memory is
+// allocated, so a pipeline that decodes image after image can reuse one
+// buffer. The bounds of dst must be exactly image.Rect(0, 0, w.Width,
+// w.Height); a size mismatch, a nil target or an animated file is an error and
+// leaves dst untouched. The pixel budget is the default one (1<<27 pixels).
+func (w *Webp) DecodeInto(dst *image.NRGBA) error {
+	if dst == nil {
+		return errors.New("webp: nil image")
+	}
+	b := dst.Bounds()
+	if b.Min.X != 0 || b.Min.Y != 0 || b.Dx() != w.Width || b.Dy() != w.Height {
+		return errors.Errorf("webp: destination is %v, image is %dx%d", b, w.Width, w.Height)
+	}
+	if w.HasAnimation {
+		return errors.Wrap(ErrUnsupported, "DecodeInto for an animation")
+	}
+	switch {
+	case w.VP8L != nil:
+		pix, width, height, err := vp8l.DecodeARGBLimit(w.VP8L.Data, defaultMaxPixels)
+		if err != nil {
+			return errors.Wrap(err, "webp: vp8l")
+		}
+		if width != w.Width || height != w.Height {
+			return errors.Errorf("webp: bitstream is %dx%d, container says %dx%d", width, height, w.Width, w.Height)
+		}
+		for i, p := range pix {
+			o := i * 4
+			dst.Pix[o+0] = byte(p >> 16)
+			dst.Pix[o+1] = byte(p >> 8)
+			dst.Pix[o+2] = byte(p)
+			dst.Pix[o+3] = byte(p >> 24)
+		}
+	case w.VP8 != nil:
+		img, err := vp8.DecodeLimit(w.VP8.Data, defaultMaxPixels)
+		if err != nil {
+			return errors.Wrap(err, "webp: vp8")
+		}
+		// 位流自己的宽高必须与容器一致，否则转换会静默不写任何像素。
+		// The bitstream's own size has to match the container, otherwise the
+		// conversion would silently write nothing.
+		if img.Rect.Dx() != w.Width || img.Rect.Dy() != w.Height {
+			return errors.Errorf("webp: bitstream is %dx%d, container says %dx%d", img.Rect.Dx(), img.Rect.Dy(), w.Width, w.Height)
+		}
+		ycbcrToNRGBAInto(dst, img)
+		if w.ALPH != nil {
+			if err = applyAlpha(dst, w.ALPH); err != nil {
+				return err
+			}
+		}
+	default:
+		return errors.New("webp: no image data")
+	}
+	return nil
 }
 
 // ToImage 解码图像并以 image.Image 返回。无损文件走 VP8L 解码器，有损文件走

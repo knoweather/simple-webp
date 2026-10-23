@@ -439,6 +439,11 @@ type ANMF struct {
 	// reserved bits to be zero; the parsed value is kept so that an untouched
 	// file is written back byte for byte.
 	flags uint8
+
+	// maxChunkSize 是解析嵌套子 chunk 时的载荷上限；0 表示默认值。
+	// maxChunkSize caps the payload of the nested sub-chunks; 0 means the
+	// default.
+	maxChunkSize int
 }
 
 // ChunkName 返回 ANMF 的 chunk 类型码。
@@ -471,7 +476,7 @@ func (a *ANMF) Parse(c *RawChunk) error {
 		// 逐个读出嵌套的子 chunk 直到流结束；未知类型的子 chunk 只记录不解析。
 		// Read the nested sub-chunks until the stream ends; unknown types are
 		// recorded but not decoded.
-		sub, err := readRiffChunk(r)
+		sub, err := readRiffChunk(r, a.maxChunkSize)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
