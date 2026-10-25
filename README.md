@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.svg" width="180" alt="The Go gopher wearing a red scarf, holding up a framed picture">
+</p>
+
 # simple-webp
 
 Pure-Go **WebP decode + encode** — VP8 lossy, VP8L lossless, ALPH, animation —
@@ -518,3 +522,7 @@ dependency.
 Thanks to **[Tencent WorkBuddy](https://cloud.tencent.com/product/workbuddy)**
 for the free quota of the **Step 5 Preview** model that made this project
 possible.
+
+The Go gopher was designed by [Renee French](https://reneefrench.blogspot.com/) and is
+licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). The logo in
+[`docs/logo.svg`](docs/logo.svg) is a derivative work based on that design.

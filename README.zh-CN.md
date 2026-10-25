@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.svg" width="180" alt="戴红围巾、抱着相框的 Go gopher">
+</p>
+
 # simple-webp
 
 纯 Go 的 **WebP 解码 + 编码** —— VP8 有损、VP8L 无损、ALPH 透明通道、动画。
@@ -467,3 +471,7 @@ go test -fuzz FuzzParseWebp   # fuzz（目标：不 panic、不 OOM）
 
 感谢 **[腾讯 WorkBuddy](https://cloud.tencent.com/product/workbuddy)**
 提供的免费额度的 **Step 5 Preview** 模型支持本项目完成。
+
+Go gopher 由 [Renee French](https://reneefrench.blogspot.com/) 设计，采用
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/) 许可；
+[`docs/logo.svg`](docs/logo.svg) 的 logo 是基于该形象的演绎作品。
