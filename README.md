@@ -355,7 +355,7 @@ the container and encoder work in this series:
 |---|---|---|
 | container parse (320×240, 37 KB) | **17.3 µs** (2.2 GB/s) | — |
 | VP8L lossless decode (320×240, 320×240 photo) | 2.15 ms (35.7 MP/s) | 1.61 ms (47.6 MP/s) |
-| VP8 lossy decode (400×300) | **1.19 ms** (101 MP/s) | 0.67 ms (179 MP/s) |
+| VP8 lossy decode (400×300) | **0.88 ms** (136 MP/s) | 0.67 ms (179 MP/s) |
 | VP8L lossless encode (320×240) | 35.6 ms (2.16 MP/s) | not supported |
 
 > The numbers above come from one run on the machine used for this series and
@@ -369,6 +369,42 @@ was added on the encode side, which does not change the decoder. Lossless
 encoding now tries the colour-transform, colour-cache and meta-Huffman variants
 and keeps the shortest stream, so it is slower than before and its output is
 smaller; the size ratio against `cwebp` was not re-measured here.
+
+## SIMD kernels
+
+A VP8 decode ends with two per-pixel loops: the 9:3:3:1 "fancy" chroma
+upsampling and the BT.601 YUV to RGBA conversion. Together they were about a
+third of a 400×300 decode on the machine used for this series, so both now
+dispatch to a per-architecture kernel while the original loops stay in the
+tree as the reference implementation and as the fallback.
+
+- the seam: `decodeBand` hands a whole row to `yuvRowToNRGBA`, and
+  `upsampleChromaRow` keeps its signature but runs a kernel over the interior
+  samples, leaving the two horizontally clamped ends to scalar code
+- amd64: AVX2 behind a CPUID + XGETBV probe rather than behind `GOAMD64`, so a
+  single binary still runs on any x86-64 machine (`yuvrgb_amd64.s`,
+  `chroma_amd64.s`)
+- wasm: SIMD128 written as raw WebAssembly stack instructions over v128 locals
+  (`yuvrgb_wasm.s`, `chroma_wasm.s`); there is no runtime probe, the host
+  decides whether SIMD128 exists
+- arm64: a NEON chroma kernel (`chroma_arm64.s`); the YUV kernel stays scalar
+  because Go's arm64 assembler lacks VMOVL/VMLAL/VQMOVN/VMIN/VMAX
+- every other target, and any build with `-tags purego`, keeps the scalar loops
+
+| Kernel, 1920-pixel row | scalar | AVX2 (amd64) | SIMD128 (wasm) |
+|---|---|---|---|
+| `upsampleChromaRow` | 3.1 µs | 0.23 µs (13.6×) | 0.52 µs (18×) |
+| `yuvRowToNRGBA` | 8.9 µs | 0.68 µs (13×) | 1.53 µs (14×) |
+
+End to end, `photo_real.webp` (400×300) decodes in 0.88 ms instead of 1.11 ms
+on amd64 (1.26×); under Node 22 the same file drops from 6.75 ms to 2.38 ms
+(2.8×). Lossless decoding and encoding are untouched.
+
+Output is unchanged: the decode fixtures still compare pixel for pixel, and
+`TestYUVRowMatchesScalar` / `TestChromaRowMatchesScalar` compare every kernel
+against its scalar reference across row lengths 1..257 and chroma widths
+1..48. `go test -bench 'YUVRow|ChromaRow'` reproduces the kernel numbers, and
+`-tags purego` reproduces the scalar path on any machine.
 
 ## Known limitations
 

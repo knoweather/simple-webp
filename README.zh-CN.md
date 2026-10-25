@@ -339,7 +339,7 @@ Windows / amd64，`go test -run XXX -bench . -benchtime 200ms`，本系列容器
 |---|---|---|
 | 容器解析（320×240，37 KB） | **17.3 µs**（2.2 GB/s） | — |
 | VP8L 无损解码（320×240） | 2.15 ms（35.7 MP/s） | 1.61 ms（47.6 MP/s） |
-| VP8 有损解码（400×300） | **1.19 ms**（101 MP/s） | 0.67 ms（179 MP/s） |
+| VP8 有损解码（400×300） | **0.88 ms**（136 MP/s） | 0.67 ms（179 MP/s） |
 | VP8L 无损编码（320×240） | 35.6 ms（2.16 MP/s） | 不支持 |
 
 > 以上数字来自本机一次运行并做了取整；早先与 libwebp 的对比测于另一台机器，本环境
@@ -350,6 +350,36 @@ Windows / amd64，`go test -run XXX -bench . -benchtime 200ms`，本系列容器
 `cwebp` 的体积比这次没有重新测量。
 
 ---
+
+## SIMD 内核
+
+VP8 解码的收尾是两个逐像素循环：9:3:3:1 "fancy" 色度上采样和 BT.601
+YUV→RGBA 转换。在本系列的机器上，这两段约占 400×300 一帧解码时间的三分之一，
+因此现在各自派发到按架构实现的内核，原来的循环保留在树里作为参考实现与回退。
+
+- 接缝：`decodeBand` 整行交给 `yuvRowToNRGBA`；`upsampleChromaRow` 保持签名，
+  内部只把中间样本交给内核，两端可能触发水平钳位的像素仍走标量
+- amd64：AVX2，用 CPUID + XGETBV 在启动时探测，而不依赖 `GOAMD64`，因此一份
+  二进制仍可在任意 x86-64 机器上运行（`yuvrgb_amd64.s`、`chroma_amd64.s`）
+- wasm：SIMD128，直接写 WebAssembly 栈式指令配 v128 局部变量
+  （`yuvrgb_wasm.s`、`chroma_wasm.s`）；没有运行时探测，由宿主决定是否支持
+- arm64：色度的 NEON 内核（`chroma_arm64.s`）；YUV 内核仍走标量，因为 Go 的
+  arm64 汇编器没有 VMOVL/VMLAL/VQMOVN/VMIN/VMAX
+- 其它平台以及任何 `-tags purego` 构建继续使用标量循环
+
+| 内核（1920 像素一行） | 标量 | AVX2 (amd64) | SIMD128 (wasm) |
+|---|---|---|---|
+| `upsampleChromaRow` | 3.1 µs | 0.23 µs（13.6×） | 0.52 µs（18×） |
+| `yuvRowToNRGBA` | 8.9 µs | 0.68 µs（13×） | 1.53 µs（14×） |
+
+端到端：`photo_real.webp`（400×300）在 amd64 上从 1.11 ms 降到 0.88 ms
+（1.26×）；同一文件在 Node 22 下从 6.75 ms 降到 2.38 ms（2.8×）。无损解码与
+编码不受影响。
+
+输出没有变化：解码基准文件仍逐像素比对，`TestYUVRowMatchesScalar` /
+`TestChromaRowMatchesScalar` 用行宽 1..257 与色度宽度 1..48 把每个内核与它的
+标量参考实现逐位比对。`go test -bench 'YUVRow|ChromaRow'` 可复现内核数字，
+`-tags purego` 可在任意机器上复现标量路径。
 
 ## 已知限制
 
