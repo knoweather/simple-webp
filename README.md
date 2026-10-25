@@ -370,6 +370,43 @@ encoding now tries the colour-transform, colour-cache and meta-Huffman variants
 and keeps the shortest stream, so it is slower than before and its output is
 smaller; the size ratio against `cwebp` was not re-measured here.
 
+## SIMD kernels behind `GOEXPERIMENT=simd`
+
+Go 1.27 carries an experimental `simd` package, enabled with
+`GOEXPERIMENT=simd`. Behind that flag the two row loops at the end of a VP8
+decode — 9:3:3:1 chroma upsampling and the BT.601 YUV to RGBA conversion — are
+reimplemented on top of `simd/archsimd`, which makes the same comparison
+against Go-level SIMD that the hand-written assembly branch makes against
+assembly.
+
+- the seam: `decodeBand` hands a whole row to `yuvRowToNRGBA`, and
+  `upsampleChromaRow` keeps its signature but runs a kernel over the interior
+  samples, leaving the two clamped ends to scalar code
+- the portable `simd` package cannot express these kernels: it has no widening
+  conversion (byte to halfword or word) and no byte permute or interleave,
+  leaving only load/store and arithmetic on lanes that are already the right
+  width
+- the kernels therefore use `simd/archsimd` with 128-bit types (`Uint8x16`,
+  `Uint16x8`, `Int32x4`) and are amd64 only: the amd64 and arm64 backends
+  expose different method sets (arm64 has `InterleaveLo` but no
+  `ConcatPermute`, and no `SaturateToUint8` on `Uint32x4`)
+- without the experiment the scalar loops are compiled, so a normal build and
+  every other target are unaffected
+
+| Kernel, 1920-pixel row | scalar | `simd` |
+|---|---|---|
+| `upsampleChromaRow` | 2.69 µs | 1.22 µs (2.2×) |
+| `yuvRowToNRGBA` | 7.21 µs | 3.18 µs (2.3×) |
+
+End to end, `photo_real.webp` (400×300) goes from 1.20 ms to 1.03 ms (1.17×);
+lossless decoding and encoding are unchanged. For comparison, the
+hand-written AVX2 kernels on the `asm` branch reach 13× at the kernel level
+and 1.26× end to end, because they use 256-bit vectors and avoid the
+bounds-checked partial loads and the extra call layer.
+
+Run it with `GOEXPERIMENT=simd go test ./...`; `GODEBUG=simd=0` forces the
+emulated path and `GODEBUG=simd=256` requests a vector length.
+
 ## Known limitations
 
 - `EncodeOptions.Lossless` is accepted but ignored: `Encode` always writes

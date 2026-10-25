@@ -351,6 +351,33 @@ Windows / amd64，`go test -run XXX -bench . -benchtime 200ms`，本系列容器
 
 ---
 
+## `GOEXPERIMENT=simd` 的 SIMD 内核
+
+Go 1.27 带了一个实验性的 `simd` 包，用 `GOEXPERIMENT=simd` 打开。打开后，
+VP8 解码收尾的两个逐像素循环——9:3:3:1 色度上采样与 BT.601 YUV→RGBA 转换——
+改用 `simd/archsimd` 重新实现，从而可以和汇编分支做同一种横向比较。
+
+- 接缝：`decodeBand` 整行交给 `yuvRowToNRGBA`；`upsampleChromaRow` 保持签名，
+  内部只把中间样本交给内核，两端可能触发水平钳位的像素仍走标量
+- 可移植的 `simd` 包写不了这两个内核：它没有宽化转换（byte→半字/字），也没有
+  字节置换或交织，只剩 load/store 与「通道宽度本来就对」的算术
+- 因此内核用的是 `simd/archsimd` 的 128 位类型（`Uint8x16`、`Uint16x8`、
+  `Int32x4`），且目前只有 amd64：amd64 与 arm64 后端的方法集不同（arm64 有
+  `InterleaveLo`，但没有 `ConcatPermute`，`Uint32x4` 上也没有 `SaturateToUint8`）
+- 不开实验开关时编译的是标量循环，普通构建与其它平台都不受影响
+
+| 内核（1920 像素一行） | 标量 | `simd` |
+|---|---|---|
+| `upsampleChromaRow` | 2.69 µs | 1.22 µs（2.2×） |
+| `yuvRowToNRGBA` | 7.21 µs | 3.18 µs（2.3×） |
+
+端到端：`photo_real.webp`（400×300）从 1.20 ms 降到 1.03 ms（1.17×）；无损
+解码与编码不受影响。作为对照，汇编分支手写的 AVX2 内核在 kernel 级是 13×、
+端到端 1.26×，因为它用 256 位向量，而且没有带边界检查的分段加载和额外的调用层。
+
+运行方式：`GOEXPERIMENT=simd go test ./...`；`GODEBUG=simd=0` 强制模拟路径，
+`GODEBUG=simd=256` 指定向量长度。
+
 ## 已知限制
 
 - `EncodeOptions.Lossless` 被接受但忽略：`Encode` 只写 VP8L 无损，有损走 `EncodeLossy`。
