@@ -13,38 +13,22 @@ package simple_webp
 // a pure win: the old code did eight clamped chromaAt lookups per pixel (four
 // horizontal plus four vertical); now only the two row ends need clamping.
 //
-// 行级路径也是将来向量化的自然落点：upsampleChromaRow 这一层接缝由
-// chroma_test.go 用未重构的 upsampleChroma 逐位把关。
+// 向量化的落点也在这里：两端的钳位（j=0 与 j=cw-1）交给标量，中间部分按
+// 8 个色度样本一组交给 SIMD 内核；chroma_test.go 用未重构的 upsampleChroma
+// 逐位把关。
 //
-// The row-level path is also the natural seam for a future vectorization:
-// chroma_test.go pins upsampleChromaRow bit for bit against the un-refactored
-// upsampleChroma.
+// Vectorisation plugs in at the same seam: the two clamped ends (j=0 and
+// j=cw-1) stay scalar while the interior runs through a SIMD kernel eight
+// chroma samples at a time, with chroma_test.go pinning the result bit for
+// bit against the un-refactored upsampleChroma.
 
-// upsampleChromaRow 用 9:3:3:1 "fancy" 滤波为输出行生成上采样后的色度，
-// 结果写入 dst[0:w]（取值 0..255）。
+// upsampleChromaRowScalar 用标量路径产生 dst[x0:x1] 的上采样色度，
+// 钳位规则与 chromaAt 一致。
 //
-// centerRow 是中心色度行（k=y>>1），vertRow 是垂直邻居色度行
-// （k+dk 已由调用方按平面高度钳位）。水平方向的 tap 越界时钳位到
-// [0, cw-1]，与 chromaAt 的行为一致。
-//
-// upsampleChromaRow produces the "fancy" 9:3:3:1 upsampled chroma for one
-// output row into dst[0:w] (values 0..255).
-//
-// centerRow is the centre chroma row (k=y>>1); vertRow is the vertical
-// neighbour row (k+dk already clamped to the plane height by the caller).
-// Horizontal taps out of range are clamped to [0, cw-1], matching chromaAt.
-//
-// 色度样本与其 2x2 亮度块的左上角像素共位：块内偶数 x 用左邻居（j-1）、
-// 奇数 x 用右邻居（j+1），j=x>>1。行指针已由调用方定好，这里只处理水平
-// 钳位，因此内循环除两端外没有分支判断。
-//
-// A chroma sample is co-sited with the top left pixel of its 2x2 luma
-// block: even x takes the left neighbour (j-1) and odd x the right one
-// (j+1), with j=x>>1. The row pointers are already resolved by the caller,
-// so only horizontal clamping remains and the inner loop is branch free
-// apart from the two row ends.
-func upsampleChromaRow(dst []byte, centerRow, vertRow []byte, cw, w int) {
-	for x := 0; x < w; x++ {
+// upsampleChromaRowScalar produces the upsampled chroma for dst[x0:x1] on the
+// scalar path, clamping exactly like chromaAt.
+func upsampleChromaRowScalar(dst, centerRow, vertRow []byte, cw, x0, x1 int) {
+	for x := x0; x < x1; x++ {
 		j := x >> 1
 		jh := j + 1
 		if x&1 == 0 {
