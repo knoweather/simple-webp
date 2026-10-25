@@ -140,14 +140,7 @@ func decodeBand(dst *image.NRGBA, src *image.YCbCr, cw, ch, w, y0, y1 int, scrat
 		upsampleChromaRow(uRow, cbC, cbV, cw, w)
 		upsampleChromaRow(vRow, crC, crV, cw, w)
 
-		for x := 0; x < w; x++ {
-			r, g, bl := yuvToRGB(int(yRow[x]), int(uRow[x]), int(vRow[x]))
-			o := x * 4
-			dstRow[o+0] = r
-			dstRow[o+1] = g
-			dstRow[o+2] = bl
-			dstRow[o+3] = 255
-		}
+		yuvRowToNRGBA(dstRow, yRow, uRow, vRow)
 	}
 }
 
