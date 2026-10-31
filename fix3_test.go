@@ -3,13 +3,10 @@ package simple_webp
 import (
 	"testing"
 )
-
-// fix3_test.go 覆盖第二轮审计（fix/fix3.md）的五项修复。
-
-// TestAddRawChunkRejectsDuplicates 覆盖 N-01：单实例 chunk 重复插入被拒绝，
+// TestAddRawChunkRejectsDuplicates 校验：单实例 chunk 重复插入被拒绝，
 // ANMF 的载荷必须是一帧合法的帧，合法帧与未知类型仍然可以插入。
 //
-// TestAddRawChunkRejectsDuplicates covers N-01: a duplicate of a single-instance
+// TestAddRawChunkRejectsDuplicates checks that a duplicate of a single-instance
 // chunk is refused, an ANMF payload has to be a valid frame, while a valid
 // frame and unknown chunk types still go in.
 func TestAddRawChunkRejectsDuplicates(t *testing.T) {
@@ -111,10 +108,10 @@ func TestAddRawChunkRejectsDuplicates(t *testing.T) {
 	}
 }
 
-// TestAssignedALPHAndANIMAreWritten 覆盖 N-02：直接赋值的 ALPH/ANIM 必须写出，
+// TestAssignedALPHAndANIMAreWritten 校验：直接赋值的 ALPH/ANIM 必须写出，
 // VP8X 的对应标志位同步，输出能通过严格模式；会产生非法流的组合返回错误。
 //
-// TestAssignedALPHAndANIMAreWritten covers N-02: an assigned ALPH/ANIM has to
+// TestAssignedALPHAndANIMAreWritten checks that an assigned ALPH/ANIM has to
 // be written with the matching VP8X flags and the output has to pass strict
 // mode; combinations that would produce an invalid stream are errors.
 func TestAssignedALPHAndANIMAreWritten(t *testing.T) {
@@ -203,10 +200,10 @@ func TestAssignedALPHAndANIMAreWritten(t *testing.T) {
 	}
 }
 
-// TestWriteRejectsOutOfRangeFrameFields 覆盖 N-03 与 N-04：赋值的奇数帧坐标
+// TestWriteRejectsOutOfRangeFrameFields 校验：赋值的奇数帧坐标
 // 与超出 24 位的时长在写回时报错，边界值正常。
 //
-// TestWriteRejectsOutOfRangeFrameFields covers N-03 and N-04: an assigned odd
+// TestWriteRejectsOutOfRangeFrameFields checks that an assigned odd
 // frame position or an out-of-range duration is an error on write, while the
 // boundary values are fine.
 func TestWriteRejectsOutOfRangeFrameFields(t *testing.T) {
@@ -219,7 +216,7 @@ func TestWriteRejectsOutOfRangeFrameFields(t *testing.T) {
 		return w
 	}
 
-	// N-03：奇数坐标 / odd position
+	// 奇数坐标 / odd position
 	for _, pos := range [][2]int{{7, 0}, {0, 7}, {-2, 0}} {
 		w := load(t)
 		w.ANMFs[0].X, w.ANMFs[0].Y = pos[0], pos[1]
@@ -242,7 +239,7 @@ func TestWriteRejectsOutOfRangeFrameFields(t *testing.T) {
 		t.Fatalf("even position came back as %d,%d", w2.ANMFs[0].X, w2.ANMFs[0].Y)
 	}
 
-	// N-04：时长越界 / duration out of range
+	// 时长越界 / duration out of range
 	for _, dur := range []int{1 << 24, -1} {
 		w := load(t)
 		w.ANMFs[0].Duration = dur

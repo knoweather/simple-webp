@@ -223,10 +223,10 @@ func TestSegmentRoundTripPixels(t *testing.T) {
 	}
 }
 
-// TestCheckFirstPartition 覆盖 N-05：首分区长度超出帧标签的 19 位字段时报错，
+// TestCheckFirstPartition 校验：首分区长度超出帧标签的 19 位字段时报错，
 // 边界值放行。
 //
-// TestCheckFirstPartition covers N-05: a first-partition length above the 19
+// TestCheckFirstPartition checks that a first-partition length above the 19
 // bit field of the frame tag is an error, the boundary value passes.
 func TestCheckFirstPartition(t *testing.T) {
 	if err := checkFirstPartition(0); err != nil {

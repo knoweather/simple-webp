@@ -264,13 +264,15 @@ A transparent input makes the lossy encoder write the extended format
 The lossy encoder chooses its modes by rate distortion. Every candidate mode
 is predicted, transformed and quantized, and the candidates are scored on the
 distortion of the reconstruction plus lambda times the number of bits their
-tokens take; the cheapest one wins. The luma of a macroblock is either one
-16×16 mode or sixteen 4×4 modes, whichever comes out cheaper, and the chroma
-uses one of the four 8×8 modes. On a set of five test images the size at
-matched PSNR drops by 6.7% against plain SAD mode selection (a 320×240 photo
-−3%, a smooth gradient −14%, a sharp synthetic image −38%, noise −0%). The
-search costs about 3.5x the encoding time: 18 ms instead of 5 ms for a
-320×240 photo.
+tokens take; the cheapest one wins. The candidates are ranked by their absolute
+prediction error first, and only the cheapest ones are scored in full: two of
+the four 16×16 modes, and four of the ten 4×4 modes, which fall back to the
+single cheapest one when its error is already below a flatness threshold. The
+luma of a macroblock is either one 16×16 mode or sixteen 4×4 modes, whichever
+comes out cheaper, and the chroma uses one of the four 8×8 modes. On a set of
+five test images the size at matched PSNR drops by 6.7% against plain SAD mode
+selection (a 320×240 photo −3%, a smooth gradient −14%, a sharp synthetic image
+−38%, noise −0%).
 
 ### Custom chunks
 
