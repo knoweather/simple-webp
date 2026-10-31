@@ -66,23 +66,109 @@ func (e *encoder) chooseLumaMode(mbx, mby, bx, by int) (bool, uint8) {
 	if cost16 <= cost4 {
 		copy(e.levels[:256], e.candLevels[:256])
 		copy(e.levels[384:], e.candLevels[384:])
+		e.lastNZ = e.candLastNZ
 		return true, mode16
 	}
 	e.y4Blocks++
 	return false, 0
 }
 
+// sadBlock16 是 16x16 绝对差之和的入口。支持 AVX2 的 amd64 机器在包初始化
+// 时把它换成汇编内核，其余平台走标量版本；两者结果相同。函数体有 256 次循环，
+// 本来就不会被内联，所以走函数指针不损失什么。
+//
+// sadBlock16 is the entry point for the sum of absolute differences over a
+// 16x16 block. On amd64 machines with AVX2 the package initialisation swaps in
+// the assembly kernel and other platforms use the scalar version; both agree.
+// The body loops 256 times and would never be inlined anyway, so the indirect
+// call costs nothing.
+var sadBlock16 = sadBlock16Scalar
+
+// sadBlock16Scalar 返回 16x16 块上预测像素与原始像素的绝对差之和，用作 16x16
+// 模式的预筛代价。与 sadBlock4 同一套逻辑，只是块更大；分开写是为了让两处
+// 的内层循环边界都能被编译器折叠成常量。
+//
+// sadBlock16Scalar returns the sum of absolute differences between the
+// prediction and the source over a 16x16 block, the pre-filter cost for 16x16
+// modes. It is the same logic as sadBlock4 on a bigger block; the two are kept
+// apart so the compiler can fold both inner loop bounds into constants.
+func sadBlock16Scalar(pred, src *plane, x, y int) int {
+	s := 0
+	pi := pred.at(x, y)
+	si := src.at(x, y)
+	for j := 0; j < 16; j++ {
+		for i := 0; i < 16; i++ {
+			d := int(pred.pix[pi+i]) - int(src.pix[si+i])
+			if d < 0 {
+				d = -d
+			}
+			s += d
+		}
+		pi += pred.stride
+		si += src.stride
+	}
+	return s
+}
+
+// y16Candidates 是 16x16 亮度模式进入完整率失真评估的候选数。四种模式里先用
+// 绝对差排序，只有最便宜的两个走完变换、量化、重建与码率估计。
+//
+// 实测这一步省下约百分之八的编码时间，代价是同质量下体积涨千分之二：被跳过的
+// 两个模式偶尔会在码率上反超，但绝对差排序基本抓得住真正的赢家。
+//
+// y16Candidates is how many 16x16 luma modes reach the full rate-distortion
+// evaluation. The four modes are ranked by absolute difference and only the two
+// cheapest are transformed, quantised, reconstructed and rate estimated.
+//
+// Measured, this saves about eight percent of the encode time for two tenths of
+// a percent in size at the same quality: a skipped mode occasionally wins on
+// rate, but ranking by absolute difference catches the real winner almost
+// always.
+const y16Candidates = 2
+
 // evalLuma16 评估四种 16x16 亮度模式，返回代价最小的那个的代价与模式；最优
 // 模式的系数留在 e.candLevels 里。
 //
+// 四种模式先按预测的绝对差排序，只把前 y16Candidates 个送进完整评估。
+//
 // evalLuma16 evaluates the four 16x16 luma modes and returns the cost and the
 // mode of the cheapest one; the coefficients of that mode land in e.candLevels.
+//
+// The four modes are first ranked by the absolute error of their prediction and
+// only the best y16Candidates reach the full evaluation.
 func (e *encoder) evalLuma16(mbx, mby, bx, by int, lambda float64) (float64, uint8) {
 	d := &e.d
 	savedLeft, savedUp := d.leftMB, d.upMB[mbx]
+
+	// 预筛：predict16 只读块外邻居，连续调用互不影响。
+	// Pre-filter: predict16 only reads outside the block, so the predictions
+	// can be run back to back.
+	var sad [4]int
+	for k, mode := range y16Modes {
+		d.leftMB, d.upMB[mbx] = savedLeft, savedUp
+		d.predict16(checkTopLeftPred(mbx, mby, mode), bx, by)
+		sad[k] = sadBlock16(d.y, e.srcY, bx, by)
+	}
+
+	// 选出绝对差最小的两个模式，顺序保留「先小后大」。
+	// Pick the two cheapest modes, keeping the cheaper one first.
+	first, second := 0, 1
+	if sad[1] < sad[0] {
+		first, second = 1, 0
+	}
+	for k := 2; k < len(sad); k++ {
+		if sad[k] < sad[first] {
+			second, first = first, k
+		} else if sad[k] < sad[second] {
+			second = k
+		}
+	}
+	cand := [y16Candidates]int{first, second}
+
 	bestCost := math.Inf(1)
 	bestMode := uint8(predDC)
-	for _, mode := range y16Modes {
+	for c := 0; c < y16Candidates; c++ {
+		mode := y16Modes[cand[c]]
 		d.leftMB, d.upMB[mbx] = savedLeft, savedUp
 		d.predict16(checkTopLeftPred(mbx, mby, mode), bx, by)
 		e.transformLuma16(bx, by)
@@ -96,6 +182,7 @@ func (e *encoder) evalLuma16(mbx, mby, bx, by int, lambda float64) (float64, uin
 			bestCost, bestMode = cost, mode
 			copy(e.candLevels[:256], e.levels[:256])
 			copy(e.candLevels[384:], e.levels[384:])
+			e.candLastNZ = e.lastNZ
 		}
 	}
 	d.leftMB, d.upMB[mbx] = savedLeft, savedUp
@@ -117,6 +204,7 @@ func (e *encoder) evalLuma4(mbx, mby, bx, by int, lambda float64) float64 {
 	for i := 384; i < 400; i++ {
 		e.levels[i] = 0
 	}
+	e.lastNZ[24] = 0
 
 	// 模式上下文取自上方与左侧邻块，与解码器跟踪的一样。
 	// The mode context comes from the above and left neighbour, exactly as the
@@ -148,32 +236,191 @@ func (e *encoder) evalLuma4(mbx, mby, bx, by int, lambda float64) float64 {
 	return total
 }
 
-// evalLuma4Block 在十种模式里为第 n 个 4x4 亮度块选代价最小的一个，返回代价、
-// 模式与该块是否有非零系数。选中模式的系数与重建像素都留在原地。
+// luma4Candidates 是 4x4 亮度块进入完整率失真评估的候选模式数。十种模式
+// 先用预测残差的绝对值和排序，只有最便宜的这么多个会走完变换、量化、重建
+// 与码率估计。取 4 是实测的平衡点：再少体积明显变大，再多则省不下时间。
 //
-// evalLuma4Block picks the cheapest of the ten modes for the n-th 4x4 luma
-// block and returns its cost, its mode and whether the block carries non-zero
+// luma4Candidates is how many 4x4 luma modes reach the full rate-distortion
+// evaluation. The ten modes are first ranked by the absolute error of their
+// prediction and only the cheapest few are transformed, quantised,
+// reconstructed and rate estimated. Four is the measured balance: fewer grows
+// the output, more saves little time.
+const luma4Candidates = 4
+
+// luma4DecisiveNum/Den 与 luma4FlatSAD 共同构成「第一名已经赢定」的判据：
+// 第二名的绝对差达到第一名的这么多倍，且第一名的绝对差本身已经很小（平均
+// 每像素不超过两档）时，其余模式不可能再追回来，只评估第一名即可。
+//
+// 只看相对差距是不够的：随机噪声上各模式的绝对差差距同样很大，但那是误差
+// 都很大的前提下的大差距，此时率失真的最优模式与绝对差的最小模式并不同一，
+// 剪到单候选会让体积明显变大。加上绝对阈值后，只有「预测本来就准」的平坦块
+// 与锐边块走单候选，纹理块仍然跑完整个候选表。
+//
+// luma4DecisiveNum/Den and luma4FlatSAD together form the "the winner is
+// already decided" test: the runner-up's error is this many times the best
+// one's and the best one's error is already small (two levels per pixel on
+// average), so the remaining modes cannot catch up and only the best is
+// evaluated.
+//
+// The relative gap alone is not enough: random noise also shows a wide gap
+// between modes, but only because every mode errs badly there, and the
+// rate-distortion optimum is not the minimum-error mode. Pruning to a single
+// candidate visibly grows the output on such content. The absolute threshold
+// keeps the single candidate for flat and hard-edged blocks, where the
+// prediction is accurate to begin with, and lets textured blocks run the whole
+// list.
+const (
+	luma4DecisiveNum = 13
+	luma4DecisiveDen = 10
+	luma4FlatSAD     = 32
+)
+
+// sadUnavailable 标记「这个模式没有参加预筛」。它必须同时满足两点：远大于
+// 任何真实的绝对差之和（4x4 块最多 16 × 255 = 4080），并且乘以
+// luma4DecisiveNum 之后仍在 int32 范围内——32 位平台上 int 就是 32 位，
+// 用 math.MaxInt32 做哨兵会在 `sad[1] * 13` 处溢出，让判据得出错误结论。
+//
+// sadUnavailable marks "this mode did not take part in the pre-filter". It has
+// to be far above any real sum of absolute differences (a 4x4 block tops out at
+// 16 * 255 = 4080) and still fit in int32 after multiplying by
+// luma4DecisiveNum: on 32 bit platforms int is 32 bits wide, and using
+// math.MaxInt32 as the sentinel overflows at `sad[1] * 13` and makes the test
+// draw the wrong conclusion.
+const sadUnavailable = 1 << 20
+
+// sadBlock4 返回 4x4 块上预测像素与原始像素的绝对差之和，用作模式预筛的
+// 快速代价。它不做平方，也不看码率，只用来排序。
+//
+// sadBlock4 returns the sum of absolute differences between the prediction and
+// the source over a 4x4 block, the cheap cost used to rank modes. It squares
+// nothing and ignores the rate; it only orders candidates.
+func sadBlock4(pred, src *plane, x, y int) int {
+	s := 0
+	pi := pred.at(x, y)
+	si := src.at(x, y)
+	for j := 0; j < 4; j++ {
+		for i := 0; i < 4; i++ {
+			d := int(pred.pix[pi+i]) - int(src.pix[si+i])
+			if d < 0 {
+				d = -d
+			}
+			s += d
+		}
+		pi += pred.stride
+		si += src.stride
+	}
+	return s
+}
+
+// topLuma4Modes 返回 sad 里代价最低的 k 个模式下标，按代价升序排列。k 大于
+// 元素数时返回全部。选择排序的常数小，十元素上比排序整个数组便宜。
+//
+// topLuma4Modes returns the indices of the k cheapest modes in sad, cheapest
+// first. When k exceeds the number of entries everything is returned. Selection
+// sort has a small constant and beats sorting all ten entries.
+func topLuma4Modes(sad *[10]int, k int) [10]int {
+	var idx [10]int
+	for i := range idx {
+		idx[i] = i
+	}
+	if k > len(sad) {
+		k = len(sad)
+	}
+	for i := 0; i < k; i++ {
+		min := i
+		for j := i + 1; j < len(sad); j++ {
+			if sad[idx[j]] < sad[idx[min]] {
+				min = j
+			}
+		}
+		idx[i], idx[min] = idx[min], idx[i]
+	}
+	return idx
+}
+
+// evalLuma4Block 为第 n 个 4x4 亮度块选代价最小的模式，返回代价、模式与该块
+// 是否有非零系数。选中模式的系数与重建像素都留在原地。
+//
+// 十种模式全跑一遍完整评估是本编码器最贵的一步（约占编码总时间的七成），
+// 而其中大多数模式的预测残差一开始就明显更大。这里先用绝对差之和排序，
+// 只把前 luma4Candidates 个送进完整评估。
+//
+// evalLuma4Block picks the cheapest mode for the n-th 4x4 luma block and
+// returns its cost, its mode and whether the block carries non-zero
 // coefficients. The levels and the reconstructed pixels of the chosen mode stay
 // in place.
+//
+// Evaluating all ten modes in full is the most expensive step of the encoder
+// (about seventy percent of the encode time), while most of them already lose
+// on the prediction residual alone. The modes are ranked by their sum of
+// absolute differences and only the best luma4Candidates reach the full
+// evaluation.
 func (e *encoder) evalLuma4Block(n, x, y, ctx int, prob *[9]uint8, lambda float64) (float64, uint8, uint8) {
 	d := &e.d
-	// 候选模式都会覆写这块的像素，先存一份备查。
-	// Every candidate overwrites the pixels of the block, so keep a copy.
-	var saved [16]byte
-	for j := 0; j < 4; j++ {
-		idx := d.y.at(x, y+j)
-		copy(d.y.pix[idx:idx+4], saved[j*4:j*4+4])
+	// 每个预测器都写满块内十六个像素，所以候选之间不需要清零：predict4 的
+	// 输出本来就覆盖上一轮留下的重建像素，addResidual4 与 ssePlane 读到的
+	// 一定是本次预测的值。
+	//
+	// Every predictor writes all sixteen pixels of the block, so candidates need
+	// no clearing: predict4's output already overwrites whatever reconstruction
+	// the previous candidate left behind, and addResidual4 and ssePlane always
+	// read this candidate's prediction.
+
+	// 预筛：predict4 只读块外邻居，连续调用互不影响，因此可以直接在同一块
+	// 上把十种预测都算一遍。
+	//
+	// 分成两级：先只算四个主模式（DC/TM/VE/HE）。平坦块与锐边块的最优模式
+	// 几乎总在其中，且预测本身就准，算完这四个就能定下来；只有主模式都不准
+	// （纹理块）才继续算六个方向模式。这样纹理块保留完整的候选表，而占多数
+	// 的平坦块省掉六次预测与六次绝对差求和。
+	//
+	// Pre-filter: predict4 only reads outside the block, so the ten
+	// predictions can be run back to back on the same block.
+	//
+	// It runs in two levels: the four primary modes first (DC/TM/VE/HE). Flat
+	// and hard-edged blocks almost always win with one of them and their
+	// prediction is already accurate, so those four settle it; only blocks
+	// where even the primary modes miss (textured ones) go on to the six
+	// directional modes. Textured blocks keep the full candidate list while the
+	// majority of flat blocks save six predictions and six error sums.
+	var sad [10]int
+	bestSad := math.MaxInt32
+	for k := 0; k < 4; k++ {
+		d.predict4(y4Modes[k], x, y)
+		sad[k] = sadBlock4(d.y, e.srcY, x, y)
+		if sad[k] < bestSad {
+			bestSad = sad[k]
+		}
 	}
+	if bestSad <= luma4FlatSAD {
+		for k := 4; k < len(sad); k++ {
+			sad[k] = sadUnavailable
+		}
+	} else {
+		for k := 4; k < len(sad); k++ {
+			d.predict4(y4Modes[k], x, y)
+			sad[k] = sadBlock4(d.y, e.srcY, x, y)
+		}
+	}
+	cand := topLuma4Modes(&sad, luma4Candidates)
+	// 自适应剪枝：预测本来就准、且第一名明显领先时，其余模式追不回来，只
+	// 评估第一名；否则把候选表跑完。
+	// Adaptive pruning: when the prediction is accurate to begin with and the
+	// best mode clearly leads, the others cannot catch up and only the best is
+	// evaluated; otherwise the whole candidate list runs.
+	nCand := luma4Candidates
+	if sad[cand[0]] <= luma4FlatSAD && sad[cand[1]]*luma4DecisiveNum >= sad[cand[0]]*luma4DecisiveDen {
+		nCand = 1
+	}
+
 	var bestLevels [16]int32
 	var bestPix [16]byte
+	bestLastNZ := uint8(0)
 	bestCost := math.Inf(1)
 	bestMode := uint8(predDC)
 	bestNZ := uint8(0)
-	for _, mode := range y4Modes {
-		for j := 0; j < 4; j++ {
-			idx := d.y.at(x, y+j)
-			copy(d.y.pix[idx:idx+4], saved[j*4:j*4+4])
-		}
+	for c := 0; c < nCand; c++ {
+		mode := y4Modes[cand[c]]
 		d.predict4(mode, x, y)
 		e.transformLuma4(n, x, y)
 		e.loadCoeffsLuma4(n)
@@ -185,6 +432,7 @@ func (e *encoder) evalLuma4Block(n, x, y, ctx int, prob *[9]uint8, lambda float6
 		if cost < bestCost {
 			bestCost, bestMode = cost, mode
 			bestNZ = e.blockIsNonZero(n)
+			bestLastNZ = e.lastNZ[n]
 			copy(bestLevels[:], e.levels[16*n:16*n+16])
 			for j := 0; j < 4; j++ {
 				idx := d.y.at(x, y+j)
@@ -193,6 +441,7 @@ func (e *encoder) evalLuma4Block(n, x, y, ctx int, prob *[9]uint8, lambda float6
 		}
 	}
 	copy(e.levels[16*n:16*n+16], bestLevels[:])
+	e.lastNZ[n] = bestLastNZ
 	for j := 0; j < 4; j++ {
 		idx := d.y.at(x, y+j)
 		copy(d.y.pix[idx:idx+4], bestPix[j*4:j*4+4])
@@ -237,10 +486,12 @@ func (e *encoder) chooseChromaMode(mbx, mby, cx, cy int) uint8 {
 		if cost < bestCost {
 			bestCost, bestMode = cost, mode
 			copy(e.candLevels[256:384], e.levels[256:384])
+			copy(e.candLastNZ[16:24], e.lastNZ[16:24])
 		}
 	}
 	d.leftMB, d.upMB[mbx] = savedLeft, savedUp
 	copy(e.levels[256:384], e.candLevels[256:384])
+	copy(e.lastNZ[16:24], e.candLastNZ[16:24])
 	return bestMode
 }
 
@@ -487,13 +738,15 @@ func writePredMode(sink *boolEncoder, prob *[9]uint8, mode uint8) {
 // an n x n block.
 func ssePlane(a, b *plane, x, y, n int) int {
 	s := 0
+	ai := a.at(x, y)
+	bi := b.at(x, y)
 	for j := 0; j < n; j++ {
-		ai := a.at(x, y+j)
-		bi := b.at(x, y+j)
 		for i := 0; i < n; i++ {
 			d := int(a.pix[ai+i]) - int(b.pix[bi+i])
 			s += d * d
 		}
+		ai += a.stride
+		bi += b.stride
 	}
 	return s
 }

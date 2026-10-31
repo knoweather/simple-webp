@@ -28,6 +28,98 @@ func TestEncodeUses4x4Modes(t *testing.T) {
 	}
 }
 
+// flatTestImage 生成一幅缓慢渐变的近平坦图，让编码器走 16x16 那条路。
+//
+// flatTestImage builds a slowly varying, nearly flat image so the encoder takes
+// the 16x16 path.
+func flatTestImage(w, h int) *image.YCbCr {
+	img := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Y[y*img.YStride+x] = uint8(60 + x*40/w + y*20/h)
+		}
+	}
+	cw, ch := (w+1)/2, (h+1)/2
+	for y := 0; y < ch; y++ {
+		for x := 0; x < cw; x++ {
+			img.Cb[y*img.CStride+x] = 100
+			img.Cr[y*img.CStride+x] = 150
+		}
+	}
+	return img
+}
+
+// TestEncode16x16IndependentDecoder 用 x/image/webp 解一份走 16x16 模式的码流，
+// 逐像素比对本库解码器的结果。
+//
+// 16x16 模式有自己的 Y2 块（Walsh-Hadamard 变换）、模式位与 DC 跳过规则，
+// 与 4x4 路径完全不共享。SAD 预筛只改变「选哪个模式」，这条测试确认选出来
+// 的模式写出来的码流仍然被独立实现认可。
+//
+// TestEncode16x16IndependentDecoder decodes a stream that took the 16x16 mode
+// path with x/image/webp and compares it pixel by pixel against this package's
+// decoder.
+//
+// The 16x16 path has its own Y2 block (Walsh-Hadamard transform), mode bits and
+// DC skipping rules, sharing nothing with the 4x4 path. The SAD pre-filter only
+// changes which mode is picked; this test confirms the stream written for that
+// choice is still accepted by an independent implementation.
+func TestEncode16x16IndependentDecoder(t *testing.T) {
+	for _, tc := range []struct {
+		w, h    int
+		quality int
+	}{
+		{64, 64, 40}, {96, 72, 75}, {128, 128, 90}, {160, 120, 60},
+	} {
+		src := flatTestImage(tc.w, tc.h)
+		e := newEncoder(tc.w, tc.h, src, tc.quality)
+		data, err := e.run()
+		if err != nil {
+			t.Fatalf("%dx%d q=%d: run: %v", tc.w, tc.h, tc.quality, err)
+		}
+		y16 := 0
+		for i := range e.decisions {
+			if e.decisions[i].useY16 {
+				y16++
+			}
+		}
+		if y16 == 0 {
+			t.Fatalf("%dx%d q=%d: the stream did not use the 16x16 mode path", tc.w, tc.h, tc.quality)
+		}
+
+		ours, err := Decode(data)
+		if err != nil {
+			t.Fatalf("%dx%d q=%d: decode: %v", tc.w, tc.h, tc.quality, err)
+		}
+		img, err := xwebp.Decode(bytes.NewReader(wrapWebP(data)))
+		if err != nil {
+			t.Fatalf("%dx%d q=%d: x/image/webp decode: %v", tc.w, tc.h, tc.quality, err)
+		}
+		ref, ok := img.(*image.YCbCr)
+		if !ok {
+			t.Fatalf("%dx%d q=%d: x/image/webp returned %T", tc.w, tc.h, tc.quality, img)
+		}
+		for y := 0; y < ours.Rect.Dy(); y++ {
+			for x := 0; x < ours.Rect.Dx(); x++ {
+				if a, b := ours.Y[y*ours.YStride+x], ref.Y[y*ref.YStride+x]; a != b {
+					t.Fatalf("%dx%d q=%d: luma mismatch at (%d,%d): %d != %d",
+						tc.w, tc.h, tc.quality, x, y, a, b)
+				}
+			}
+		}
+		cw, ch := (ours.Rect.Dx()+1)/2, (ours.Rect.Dy()+1)/2
+		for y := 0; y < ch; y++ {
+			for x := 0; x < cw; x++ {
+				if ours.Cb[y*ours.CStride+x] != ref.Cb[y*ref.CStride+x] ||
+					ours.Cr[y*ours.CStride+x] != ref.Cr[y*ref.CStride+x] {
+					t.Fatalf("%dx%d q=%d: chroma mismatch at (%d,%d)",
+						tc.w, tc.h, tc.quality, x, y)
+				}
+			}
+		}
+	}
+}
+
 // TestEncode4x4IndependentDecoder 用 x/image/webp 解一份走了 4x4 模式的码流，
 // 逐像素比对本库解码器的结果。4x4 模式的二叉树、上下文与非零标记的传播都在
 // 这里被独立实现验证。

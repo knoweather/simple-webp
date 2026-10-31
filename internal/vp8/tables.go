@@ -579,6 +579,30 @@ var coeffBands = [17]uint8{0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0}
 // (RFC 6386 §13.3).
 var zigzag = [16]uint8{0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15}
 
+// zigzagPos 是 zigzag 的逆映射：给一个系数的自然下标，返回它在扫描顺序里
+// 的位置。量化循环按自然顺序写系数，用它顺手记下最后一个非零系数的扫描
+// 位置，就不必再单独扫一遍 16 个位置。
+//
+// 用立即执行的函数字面量初始化而不是 init 函数：包内多个 init 按文件名顺序
+// 执行，而 zigzagPos 被编码路径直接使用，用变量初始化可以保证它在任何代码
+// 跑起来之前就已经填好，不依赖文件名排序。
+//
+// zigzagPos is the inverse of zigzag: given a coefficient's natural index it
+// returns the position in scan order. The quantisation loop writes coefficients
+// in natural order and uses it to record where the last non-zero coefficient
+// sits, which saves a separate sixteen position scan.
+//
+// It is filled by an immediately invoked function literal rather than an init
+// function: inits in a package run in file name order, while zigzagPos is used
+// directly by the encode path, and a variable initialiser guarantees it is
+// populated before any code runs without depending on that ordering.
+var zigzagPos = func() (pos [16]uint8) {
+	for i, z := range zigzag {
+		pos[z] = uint8(i)
+	}
+	return pos
+}()
+
 // cat3456 是 token 类别 3-6 的额外位概率表（RFC 6386 §13.2）：每行给出
 // 解码该类别剩余幅值位所需的概率，不足部分以 0 补齐到统一长度。
 // cat3456 holds the extra-bit probabilities for token categories 3 to 6

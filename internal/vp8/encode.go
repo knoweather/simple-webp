@@ -45,6 +45,32 @@ type encoder struct {
 	// candLevels the scratch space for a candidate mode.
 	levels     [400]int32
 	candLevels [400]int32
+	// lastNZ 记录每个 4x4 块的最后一个非零系数在扫描顺序里的位置加一（全零
+	// 记 0），由量化循环顺手填好。下标是系数基址除以十六：0..15 是十六个亮度
+	// 块，16..23 是色度的 Cb/Cr 各四块，24 是 Y2。
+	//
+	// 写出与估算 token 时都要知道 EOB 落在哪，原先每个块都重扫一遍十六个位置；
+	// 量化本来就要遍历这些系数，顺手记下即可。
+	//
+	// lastNZ records one past the scan position of the last non-zero coefficient
+	// of every 4x4 block (zero when the block is empty), filled in by the
+	// quantisation loop. The index is the coefficient base divided by sixteen:
+	// 0..15 are the sixteen luma blocks, 16..23 the four Cb and four Cr blocks,
+	// and 24 is Y2.
+	//
+	// Writing and estimating tokens both need to know where the EOB goes, which
+	// used to cost a sixteen position scan per block; quantisation already
+	// walks those coefficients, so it records the position on the way.
+	lastNZ [25]uint8
+	// candLastNZ 与 candLevels 配套：评估候选模式时，lastNZ 会被每个候选
+	// 覆写，选中的候选若是较早评估的那个，恢复系数时也必须把 lastNZ 一起
+	// 恢复，否则 EOB 的位置会按最后一个候选算，码流与系数对不上。
+	//
+	// candLastNZ goes with candLevels: evaluating candidates overwrites lastNZ,
+	// so when the winner was an earlier candidate its lastNZ has to be restored
+	// along with the levels, or the EOB position would follow the last
+	// candidate and the stream would not match the coefficients.
+	candLastNZ [25]uint8
 	// predY4 是选中的十六个 4x4 亮度模式。
 	//
 	// predY4 holds the sixteen chosen 4x4 luma modes.
@@ -864,6 +890,7 @@ func (e *encoder) levelsAreZero() bool {
 func (e *encoder) transformLuma16(bx, by int) {
 	d := &e.d
 	q := d.q[d.segment]
+	acq, acBias := int32(q.y1[1]), quantBias(int32(q.y1[1]))
 	var dc [16]int32
 	for n := 0; n < 16; n++ {
 		x, y := bx+(n%4)*4, by+(n/4)*4
@@ -872,18 +899,36 @@ func (e *encoder) transformLuma16(bx, by int) {
 		fdct4x4(&blk)
 		dc[n] = blk[0]
 		e.levels[16*n] = 0
+		last := 0
 		for z := 1; z < 16; z++ {
-			e.levels[16*n+z] = quantize(blk[z], q.y1[1])
+			lv := quantize(blk[z], acq, acBias)
+			e.levels[16*n+z] = lv
+			if lv != 0 {
+				if p := int(zigzagPos[z]) + 1; p > last {
+					last = p
+				}
+			}
 		}
+		e.lastNZ[n] = uint8(last)
 	}
 	fwht4x4(&dc)
+	y2dc, y2ac := int32(q.y2[0]), int32(q.y2[1])
+	dcBias, acBias2 := quantBias(y2dc), quantBias(y2ac)
+	last := 0
 	for i := 0; i < 16; i++ {
-		qq := q.y2[1]
+		qq, bias := y2ac, acBias2
 		if i == 0 {
-			qq = q.y2[0]
+			qq, bias = y2dc, dcBias
 		}
-		e.levels[384+i] = quantize(dc[i], qq)
+		lv := quantize(dc[i], qq, bias)
+		e.levels[384+i] = lv
+		if lv != 0 {
+			if p := int(zigzagPos[i]) + 1; p > last {
+				last = p
+			}
+		}
 	}
+	e.lastNZ[24] = uint8(last)
 }
 
 // transformLuma4 对一个 4x4 亮度块做残差、正变换与量化，结果留在 e.levels
@@ -898,13 +943,26 @@ func (e *encoder) transformLuma4(n, x, y int) {
 	var blk [16]int32
 	e.residual(d.y, e.srcY, x, y, &blk)
 	fdct4x4(&blk)
-	for z := 0; z < 16; z++ {
-		qq := q.y1[1]
-		if z == 0 {
-			qq = q.y1[0]
-		}
-		e.levels[16*n+z] = quantize(blk[z], qq)
+	dcq, acq := int32(q.y1[0]), int32(q.y1[1])
+	base := 16 * n
+	last := 0
+	if lv := quantize(blk[0], dcq, quantBias(dcq)); lv != 0 {
+		e.levels[base] = lv
+		last = int(zigzagPos[0]) + 1
+	} else {
+		e.levels[base] = 0
 	}
+	acBias := quantBias(acq)
+	for z := 1; z < 16; z++ {
+		lv := quantize(blk[z], acq, acBias)
+		e.levels[base+z] = lv
+		if lv != 0 {
+			if p := int(zigzagPos[z]) + 1; p > last {
+				last = p
+			}
+		}
+	}
+	e.lastNZ[base/16] = uint8(last)
 }
 
 // transformChroma 对色度做残差、正变换与量化：Cb 的四个块在前，Cr 的四个块
@@ -916,40 +974,58 @@ func (e *encoder) transformLuma4(n, x, y int) {
 func (e *encoder) transformChroma(cx, cy int) {
 	d := &e.d
 	q := d.q[d.segment]
+	dcq, acq := int32(q.uv[0]), int32(q.uv[1])
+	dcBias, acBias := quantBias(dcq), quantBias(acq)
 	for c := 0; c < 4; c++ {
 		x, y := cx+(c%2)*4, cy+(c/2)*4
 		var blk [16]int32
 		e.residual(d.cb, e.srcCb, x, y, &blk)
 		fdct4x4(&blk)
-		for z := 0; z < 16; z++ {
-			qq := q.uv[1]
-			if z == 0 {
-				qq = q.uv[0]
-			}
-			e.levels[256+16*c+z] = quantize(blk[z], qq)
-		}
+		e.quantBlock(&blk, 256+16*c, dcq, dcBias, acq, acBias)
 		e.residual(d.cr, e.srcCr, x, y, &blk)
 		fdct4x4(&blk)
-		for z := 0; z < 16; z++ {
-			qq := q.uv[1]
-			if z == 0 {
-				qq = q.uv[0]
+		e.quantBlock(&blk, 320+16*c, dcq, dcBias, acq, acBias)
+	}
+}
+
+// quantBlock 把变换后的 4x4 系数量化进 e.levels 的第 base 个位置，同时记下
+// 最后一个非零系数的扫描位置，省掉写出 token 时再扫一遍十六个位置。
+//
+// quantBlock quantizes the transformed 4x4 coefficients into e.levels at base
+// and records where the last non-zero coefficient sits in scan order, which
+// saves the token writer a sixteen position scan.
+func (e *encoder) quantBlock(blk *[16]int32, base int, dcq, dcBias, acq, acBias int32) {
+	last := 0
+	if lv := quantize(blk[0], dcq, dcBias); lv != 0 {
+		e.levels[base] = lv
+		last = int(zigzagPos[0]) + 1
+	} else {
+		e.levels[base] = 0
+	}
+	for z := 1; z < 16; z++ {
+		lv := quantize(blk[z], acq, acBias)
+		e.levels[base+z] = lv
+		if lv != 0 {
+			if p := int(zigzagPos[z]) + 1; p > last {
+				last = p
 			}
-			e.levels[320+16*c+z] = quantize(blk[z], qq)
 		}
 	}
+	e.lastNZ[base/16] = uint8(last)
 }
 
 // residual 取预测平面与源平面之差。
 //
 // residual takes the difference between the prediction and the source plane.
 func (e *encoder) residual(pred, src *plane, x, y int, out *[16]int32) {
+	pr := pred.at(x, y)
+	sr := src.at(x, y)
 	for j := 0; j < 4; j++ {
-		pr := pred.at(x, y+j)
-		sr := src.at(x, y+j)
 		for i := 0; i < 4; i++ {
 			out[4*j+i] = int32(int(src.pix[sr+i]) - int(pred.pix[pr+i]))
 		}
+		pr += pred.stride
+		sr += src.stride
 	}
 }
 
@@ -1161,20 +1237,29 @@ func (e *encoder) writeTokensChroma(mbx int) {
 // it has a non-zero coefficient. With skipDC the DC is skipped, as for the luma
 // blocks of a Y16 macroblock whose DC lives in the Y2 block.
 func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
+	// 模式搜索的估算走专用路径：同样的 token 树，但只累加比特数。把它和
+	// 真正的写出分开，估算循环里就不用每个 token 都判断一次估算标志、
+	// 取一次 sink 指针。
+	// The mode search estimates through a dedicated path: the same token tree,
+	// but only the bit count is accumulated. Splitting it from the real write
+	// keeps the estimation loop free of a flag test and a sink fetch per token.
+	if e.estimating {
+		return e.estimateBlock4(plane, ctx, skipDC, base)
+	}
 	n := 0
 	if skipDC {
 		n = 1
 	}
 	pBand, pCtx := int(coeffBands[n]), ctx
 
-	// 最后一个非零系数的扫描位置，用于决定何处写 EOB。
-	// scan position of the last non-zero coefficient, which decides where the
-	// EOB goes.
-	last := n
-	for i := n; i < 16; i++ {
-		if e.levels[base+int(zigzag[i])] != 0 {
-			last = i + 1
-		}
+	// 最后一个非零系数的扫描位置由量化时记好，这里只做下限修正：跳过 DC 时
+	// 至少要越过第一个位置。
+	// The scan position of the last non-zero coefficient was recorded during
+	// quantisation; only the lower bound is fixed up here, since skipping the
+	// DC has to step past the first position.
+	last := int(e.lastNZ[base/16])
+	if last < n {
+		last = n
 	}
 	if last == n {
 		e.putToken(plane, pBand, pCtx, 0, false)
@@ -1259,6 +1344,137 @@ func (e *encoder) writeBlock4(plane, ctx int, skipDC bool, base int) uint8 {
 	return 1
 }
 
+// costBit 返回以概率 prob 编码一个判决所需的比特数。
+//
+// costBit returns the bits needed to code one decision at probability prob.
+func costBit(prob uint8, bit bool) float64 {
+	if bit {
+		return bitCostTable[1][prob]
+	}
+	return bitCostTable[0][prob]
+}
+
+// estimateBlock4 是 writeBlock4 的估算版本：走同一棵 token 树，只把比特数
+// 累加到局部变量。模式搜索对每个候选块调用一次，约占编码时间的三成，所以
+// 这里刻意重复了 token 树的代码——把估算标志的判断、sink 指针的取用和结构体
+// 字段的读写都挪到循环外。
+//
+// 累加结果加进 e.cost.costBits，调用方按原有约定在调用前清零。
+//
+// estimateBlock4 is the estimation counterpart of writeBlock4: the same token
+// tree with the bit count accumulated in a local. The mode search calls it once
+// per candidate block, about a third of the encode time, so the token tree is
+// deliberately duplicated here to hoist the estimation flag test, the sink
+// fetch and the struct field traffic out of the loop.
+//
+// The total is added to e.cost.costBits; callers clear it beforehand as before.
+func (e *encoder) estimateBlock4(plane, ctx int, skipDC bool, base int) uint8 {
+	n := 0
+	if skipDC {
+		n = 1
+	}
+	pBand, pCtx := int(coeffBands[n]), ctx
+	bits := 0.0
+	// 概率表按 (plane, band, ctx) 取一次指针，循环里只做最后一维索引，
+	// 省掉每个 token 都要算的三层偏移。
+	// The probability table is fetched once per (plane, band, ctx) and the
+	// loop only indexes the last dimension, saving a three level offset
+	// computation per token.
+	p := &defaultTokenProb[plane][pBand][pCtx]
+
+	// 最后一个非零系数的扫描位置由量化时记好，这里只做下限修正。
+	// The scan position of the last non-zero coefficient was recorded during
+	// quantisation; only the lower bound is fixed up here.
+	last := int(e.lastNZ[base/16])
+	if last < n {
+		last = n
+	}
+	if last == n {
+		e.cost.costBits += costBit(p[0], false)
+		return 0
+	}
+	bits += costBit(p[0], true)
+
+	for n < 16 {
+		n++
+		v := e.levels[base+int(zigzag[n-1])]
+		if v == 0 {
+			bits += costBit(p[1], false)
+			pBand, pCtx = int(coeffBands[n]), 0
+			p = &defaultTokenProb[plane][pBand][pCtx]
+			continue
+		}
+		bits += costBit(p[1], true)
+		mag := v
+		if mag < 0 {
+			mag = -mag
+		}
+		ctx2 := 2
+		switch {
+		case mag == 1:
+			bits += costBit(p[2], false)
+			ctx2 = 1
+		case mag == 2:
+			bits += costBit(p[2], true)
+			bits += costBit(p[3], false)
+			bits += costBit(p[4], false)
+		case mag <= 4:
+			bits += costBit(p[2], true)
+			bits += costBit(p[3], false)
+			bits += costBit(p[4], true)
+			bits += costBit(p[5], mag-3 == 1)
+		case mag <= 6:
+			bits += costBit(p[2], true)
+			bits += costBit(p[3], true)
+			bits += costBit(p[6], false)
+			bits += costBit(p[7], false)
+			bits += costBit(159, mag-5 == 1)
+		case mag <= 10:
+			bits += costBit(p[2], true)
+			bits += costBit(p[3], true)
+			bits += costBit(p[6], false)
+			bits += costBit(p[7], true)
+			bits += costBit(165, (mag-7)>>1 == 1)
+			bits += costBit(145, (mag-7)&1 == 1)
+		default:
+			cat, baseMag, nbits := 0, int32(11), 3
+			switch {
+			case mag <= 18:
+			case mag <= 34:
+				cat, baseMag, nbits = 1, 19, 4
+			case mag <= 66:
+				cat, baseMag, nbits = 2, 35, 5
+			default:
+				cat, baseMag, nbits = 3, 67, 11
+			}
+			bits += costBit(p[2], true)
+			bits += costBit(p[3], true)
+			bits += costBit(p[6], true)
+			b1 := cat >> 1
+			bits += costBit(p[8], b1 == 1)
+			bits += costBit(p[9+b1], cat&1 == 1)
+			extra := uint32(mag - baseMag)
+			for i := 0; i < nbits; i++ {
+				bits += costBit(cat3456[cat][i], extra>>uint(nbits-1-i)&1 != 0)
+			}
+		}
+		pBand, pCtx = int(coeffBands[n]), ctx2
+		p = &defaultTokenProb[plane][pBand][pCtx]
+		bits += costBit(uniformProb, v < 0)
+
+		if n == 16 {
+			break
+		}
+		more := n < last
+		bits += costBit(p[0], more)
+		if !more {
+			break
+		}
+	}
+	e.cost.costBits += bits
+	return 1
+}
+
 // putToken 统计并写出一个 token 树节点的判决。概率取自当前帧的概率表，因此
 // 第二遍会自动用上调整后的值。
 //
@@ -1303,10 +1519,15 @@ func (e *encoder) sink() *boolEncoder {
 	return &e.tok
 }
 
-// quantize 把系数按反量化因子取整成电平值。
+// quantize 把系数按反量化因子取整成电平值。bias 是取整偏置，由调用方按块
+// 预计算成 q*quantBiasNum/100——把它提出来是为了让每个系数只剩一次除法，
+// 而不是每系数都算一遍乘法和百分比除法。
 //
 // quantize rounds a coefficient into a level using the dequantization factor.
-func quantize(v int32, q uint16) int32 {
+// bias is the rounding offset, precomputed per block by the caller as
+// q*quantBiasNum/100; hoisting it leaves one division per coefficient instead
+// of a multiply and a percentage division as well.
+func quantize(v, q, bias int32) int32 {
 	if q == 0 {
 		return 0
 	}
@@ -1315,7 +1536,7 @@ func quantize(v int32, q uint16) int32 {
 	if neg {
 		a = -a
 	}
-	l := (a + int32(q)*quantBiasNum/100) / int32(q)
+	l := (a + bias) / q
 	if l > maxCoeffLevel {
 		l = maxCoeffLevel
 	}
@@ -1325,13 +1546,32 @@ func quantize(v int32, q uint16) int32 {
 	return l
 }
 
-// fdct4x4 是逆变换的正变换，就地完成：两趟蝶形后整体除以二，使常量残差
+// quantBias 返回反量化因子 q 对应的取整偏置。
+//
+// quantBias returns the rounding offset for the dequantization factor q.
+func quantBias(q int32) int32 {
+	return q * quantBiasNum / 100
+}
+
+// fdct4x4Scalar 是逆变换的正变换，就地完成：两趟蝶形后整体除以二，使常量残差
 // r 对应 DC 系数 8r，与逆变换的除以八一致。
 //
-// fdct4x4 is the forward transform of the inverse, done in place: two butterfly
-// passes and a halving, so a constant residual r maps to a DC of 8r, matching the
-// inverse's divide by eight.
-func fdct4x4(blk *[16]int32) {
+// 平台相关的 fdct4x4 在支持 AVX2 时转发到汇编内核（见 fdct_amd64.go），两者
+// 结果逐位一致。注意这里必须是**直接调用**而不是函数变量：调用点传的是
+// 栈上的临时块（`var blk [16]int32`），一旦经由函数变量转发，编译器无法证明
+// 被调函数不保存指针，就会把整块挤到堆上，每块多一次 64 字节分配。
+//
+// fdct4x4Scalar is the forward transform of the inverse, done in place: two
+// butterfly passes and a halving, so a constant residual r maps to a DC of 8r,
+// matching the inverse's divide by eight.
+//
+// The platform specific fdct4x4 forwards to the assembly kernel when AVX2 is
+// available (see fdct_amd64.go) and both agree bit for bit. The forward has to
+// be a direct call rather than a function variable: the call site passes a
+// stack temporary (`var blk [16]int32`), and going through a function variable
+// stops the compiler from proving the callee keeps no pointer, which pushes the
+// whole block to the heap and adds a 64 byte allocation per block.
+func fdct4x4Scalar(blk *[16]int32) {
 	var tmp [16]int32
 	for i := 0; i < 4; i++ {
 		x0, x1, x2, x3 := blk[i], blk[4+i], blk[8+i], blk[12+i]
