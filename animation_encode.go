@@ -90,13 +90,15 @@ func EncodeAnimation(w io.Writer, a *Animation, opt *AnimationOptions) error {
 
 // EncodeAnimationBytes 把 a 编码为完整的动图 WebP 文件并保留在内存中返回。
 // 每帧独立编码（不做帧间差分），带透明度的帧写出 ALPH 子 chunk，容器顺序为
-// VP8X、ANIM、ANMF…；画布尺寸、偶数坐标与帧矩形落在画布内都会在编码前校验。
+// VP8X、ANIM、ANMF…；画布尺寸、偶数坐标、帧矩形与 24 位时长字段都会在编码前
+// 校验。有损帧沿用 LossyOptions 的全部选项，与静态有损编码行为一致。
 //
 // EncodeAnimationBytes encodes a as an animated WebP file held in memory. Every
 // frame is encoded on its own (no inter-frame differencing), a transparent frame
 // carries an ALPH sub-chunk, and the container order is VP8X, ANIM, ANMF…; the
-// canvas size, the even positions and the frame rectangles are validated before
-// encoding.
+// canvas size, the even positions, the frame rectangles and the 24-bit frame
+// durations are validated before encoding. Lossy frames honour every field of
+// LossyOptions, just like a still lossy encode.
 func EncodeAnimationBytes(a *Animation, opt *AnimationOptions) ([]byte, error) {
 	if a == nil {
 		return nil, errors.New("webp: nil animation")
@@ -111,6 +113,12 @@ func EncodeAnimationBytes(a *Animation, opt *AnimationOptions) ([]byte, error) {
 	frames := make([][]byte, len(a.Frames))
 	hasAlpha := false
 	for i, f := range a.Frames {
+		// ANMF 的时长字段只有 24 位，编码前拒绝越界值，避免静默截断成 0。
+		// The ANMF duration is 24 bits: reject out-of-range values here instead
+		// of silently truncating them (1<<24 would become zero on the wire).
+		if f.Duration < 0 || f.Duration >= 1<<24 {
+			return nil, errors.Errorf("webp: frame %d duration %d out of range 0..%d", i, f.Duration, 1<<24-1)
+		}
 		payload, kind, alpha, frameAlpha, err := encodeAnimationFrame(f, opt)
 		if err != nil {
 			return nil, errors.Wrapf(err, "webp: frame %d", i)
@@ -178,24 +186,36 @@ func encodeAnimationFrame(f Frame, opt *AnimationOptions) ([]byte, FourCC, []byt
 	var alpha []byte
 	var err error
 	if opt != nil && opt.Lossy {
-		quality := defaultLossyQuality
-		if opt.LossyOpt != nil {
-			if opt.LossyOpt.QualityZero {
-				quality = opt.LossyOpt.Quality
-			} else if opt.LossyOpt.Quality != 0 {
-				quality = opt.LossyOpt.Quality
-			}
+		// 与静态有损图共用同一套选项解析，动画帧不再丢掉滤波、锐度、
+		// 分段、目标体积和 alpha 选项。
+		// Share the option parsing with still images so animation frames no
+		// longer drop the filter, sharpness, segment, target size and alpha
+		// settings.
+		vp8Opt, targetBytes, optErr := lossyVP8Options(opt.LossyOpt)
+		if optErr != nil {
+			return nil, "", nil, false, optErr
 		}
-		if quality < 0 || quality > 100 {
-			return nil, "", nil, false, errors.Errorf("webp: quality %d out of range 0..100", quality)
+		ycc := imageToYCbCr420(f.Image)
+		if targetBytes > 0 {
+			payload, err = vp8.EncodeToTarget(ycc, vp8Opt, targetBytes)
+		} else {
+			payload, err = vp8.EncodeWithOptions(ycc, vp8Opt)
 		}
-		payload, err = vp8.Encode(imageToYCbCr420(f.Image), quality)
 		if err != nil {
 			return nil, "", nil, false, errors.Wrap(err, "webp: vp8 encode")
 		}
 		kind = VP8Chunk
 		if hasAlpha {
-			alpha, err = encodeAlphaChunk(plane, width, height, ALPHFilterNone, false)
+			var alphaFilter uint8
+			var alphaUncompressed bool
+			if opt.LossyOpt != nil {
+				alphaFilter = opt.LossyOpt.AlphaFilter
+				alphaUncompressed = opt.LossyOpt.AlphaUncompressed
+			}
+			if alphaFilter > ALPHFilterGradient {
+				return nil, "", nil, false, errors.Errorf("webp: unsupported alpha filter %d", alphaFilter)
+			}
+			alpha, err = encodeAlphaChunk(plane, width, height, alphaFilter, alphaUncompressed)
 			if err != nil {
 				return nil, "", nil, false, err
 			}

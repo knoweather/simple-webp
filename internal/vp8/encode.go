@@ -71,6 +71,15 @@ type encoder struct {
 	// along with the levels, or the EOB position would follow the last
 	// candidate and the stream would not match the coefficients.
 	candLastNZ [25]uint8
+	// searchY16/searchCb/searchCr 记住模式搜索里赢家的重建像素。第一遍据此
+	// 不再重做宏块重建；第二遍没有搜索，仍然走完整的 buildMacroblock。
+	//
+	// searchY16/searchCb/searchCr hold the winner's reconstructed pixels from
+	// the mode search. The first pass can then skip macroblock reconstruction;
+	// the replay pass did no search and still runs the full buildMacroblock.
+	searchY16 [16 * 16]byte
+	searchCb  [8 * 8]byte
+	searchCr  [8 * 8]byte
 	// predY4 是选中的十六个 4x4 亮度模式。
 	//
 	// predY4 holds the sixteen chosen 4x4 luma modes.
@@ -190,10 +199,10 @@ type Options struct {
 	// SimpleFilter selects the simple filter (luma edges only) instead of the
 	// normal one.
 	SimpleFilter bool
-	// Sharpness 是滤波锐度 0..7，越大越保留细节。
+	// Sharpness 是滤波锐度 0..7；与 cwebp -sharpness 一致，0 最锐、7 最不锐。
 	//
-	// Sharpness is the filter sharpness, 0..7, where a larger value keeps more
-	// detail.
+	// Sharpness is the filter sharpness, 0..7; as with cwebp -sharpness, 0 is
+	// the sharpest and 7 the least sharp.
 	Sharpness int
 	// Segment 打开逐段量化：按宏块活动度把帧分成四段，平坦的宏块用更粗的
 	// 量化、繁忙的保持基础量化。开启后编码器会同时试一遍不分段的版本，
@@ -785,9 +794,14 @@ func (e *encoder) encodeMB(mbx, mby int) {
 		}
 	}
 
-	// 用选中的模式算出系数并重建像素。
-	// Compute the coefficients with the chosen modes and reconstruct.
-	e.buildMacroblock(mbx, mby, bx, by, cx, cy)
+	// 第一遍的模式搜索已经把赢家的系数与重建像素留在编码器里，不必再做一遍。
+	// 第二遍（replay）没有搜索，以及关闭复用的对照路径，仍需完整算出并重建。
+	// The first pass's mode search already left the winner's levels and pixels
+	// in the encoder. The replay pass did no search, and the comparison path
+	// with reuse disabled, still compute and reconstruct in full.
+	if e.replay || !reuseSearchLevels {
+		e.buildMacroblock(mbx, mby, bx, by, cx, cy)
+	}
 
 	skip := e.levelsAreZero()
 
@@ -824,6 +838,34 @@ func (e *encoder) encodeMB(mbx, mby int) {
 		d.upMB[mbx].nzMask = 0
 	}
 }
+
+// copyBlockFromPlane 把平面上 (x,y) 起的 size×size 像素复制到 dst。
+//
+// copyBlockFromPlane copies a size×size block of pixels into dst.
+func copyBlockFromPlane(dst []byte, p *plane, x, y, size int) {
+	for j := 0; j < size; j++ {
+		at := p.at(x, y+j)
+		copy(dst[j*size:(j+1)*size], p.pix[at:at+size])
+	}
+}
+
+// copyBlockToPlane 把 src 写回平面 (x,y) 起的 size×size 区域。
+//
+// copyBlockToPlane writes src back into a size×size block of the plane.
+func copyBlockToPlane(p *plane, x, y, size int, src []byte) {
+	for j := 0; j < size; j++ {
+		at := p.at(x, y+j)
+		copy(p.pix[at:at+size], src[j*size:(j+1)*size])
+	}
+}
+
+// reuseSearchLevels 让第一遍跳过整个宏块重建：模式搜索已经算好赢家的系数与
+// 重建像素。变量形式供测试关闭复用，与旧路径逐字节对照。
+//
+// reuseSearchLevels lets the first pass skip the whole macroblock rebuild: the
+// mode search already produced the winner's levels and reconstructed pixels.
+// It is a variable so tests can disable the reuse and compare the old path.
+var reuseSearchLevels = true
 
 // buildMacroblock 用选中的模式算出宏块的残差系数并重建像素：亮度按整块
 // 16x16 或十六个 4x4 块，色度按 8x8。

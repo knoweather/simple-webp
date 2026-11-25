@@ -3,6 +3,7 @@ package simple_webp
 import (
 	"bytes"
 	"image"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,6 +145,45 @@ func TestEncodeOutputDir(t *testing.T) {
 			if err = os.WriteFile(out, data, 0o644); err != nil {
 				t.Fatal(err)
 			}
+		}
+	}
+}
+
+// TestLossySharpnessOption 校验 Sharpness 的边界、错误与真实接线：写进帧头的
+// sharpness 字段必须随选项变化，而不是被静默丢弃。
+func TestLossySharpnessOption(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			src.SetNRGBA(x, y, color.NRGBA{R: uint8(x * 8), G: uint8(y * 8), B: 128, A: 255})
+		}
+	}
+	encode := func(sharp int) ([]byte, error) {
+		return EncodeLossyBytes(src, &LossyOptions{Quality: 75, FilterLevel: 40, Sharpness: sharp})
+	}
+	for _, bad := range []int{-1, 8} {
+		if _, err := encode(bad); err == nil {
+			t.Fatalf("sharpness %d accepted", bad)
+		}
+	}
+	sharp, err := encode(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	soft, err := encode(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(sharp, soft) {
+		t.Fatal("sharpness did not reach the VP8 frame header")
+	}
+	for _, data := range [][]byte{sharp, soft} {
+		w, err := ParseWebpBytes(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = w.ToImage(); err != nil {
+			t.Fatal(err)
 		}
 	}
 }

@@ -178,3 +178,75 @@ func TestEncodeAnimationValidation(t *testing.T) {
 		}
 	}
 }
+
+// TestEncodeAnimationLossyOptions 校验动图的有损帧确实沿用 LossyOpt：alpha
+// 行滤波写进 ALPH，滤波锐度写进 VP8 帧头。
+func TestEncodeAnimationLossyOptions(t *testing.T) {
+	frame := newAnimFrames(16, 16, true)[0]
+	encode := func(opt *LossyOptions) []byte {
+		t.Helper()
+		data, err := EncodeAnimationBytes(&Animation{
+			CanvasWidth: 16, CanvasHeight: 16, Frames: []Frame{frame},
+		}, &AnimationOptions{Lossy: true, LossyOpt: opt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	parse := func(data []byte) *Webp {
+		t.Helper()
+		w, err := ParseWebpBytes(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(w.ANMFs) != 1 {
+			t.Fatalf("frames: %d", len(w.ANMFs))
+		}
+		return w
+	}
+
+	none := parse(encode(&LossyOptions{Quality: 75, AlphaFilter: ALPHFilterNone}))
+	horizontal := parse(encode(&LossyOptions{Quality: 75, AlphaFilter: ALPHFilterHorizontal}))
+	if none.ANMFs[0].ALPH == nil || horizontal.ANMFs[0].ALPH == nil {
+		t.Fatal("expected an ALPH sub-chunk on the transparent frame")
+	}
+	if got := horizontal.ANMFs[0].ALPH.Filter; got != ALPHFilterHorizontal {
+		t.Fatalf("alpha filter = %d, want %d", got, ALPHFilterHorizontal)
+	}
+	if bytes.Equal(none.ANMFs[0].ALPH.Data, horizontal.ANMFs[0].ALPH.Data) {
+		t.Fatal("alpha filter did not change the ALPH payload")
+	}
+
+	sharp := encode(&LossyOptions{Quality: 75, FilterLevel: 40, Sharpness: 0})
+	soft := encode(&LossyOptions{Quality: 75, FilterLevel: 40, Sharpness: 7})
+	if bytes.Equal(sharp, soft) {
+		t.Fatal("sharpness did not reach the animation frame bitstream")
+	}
+}
+
+// TestEncodeAnimationDurationRange 校验 24 位时长的边界：越界直接报错，
+// 最大值必须原样写回而不是截断成零。
+func TestEncodeAnimationDurationRange(t *testing.T) {
+	frame := newAnimFrames(16, 16, false)[0]
+	for _, duration := range []int{-1, 1 << 24} {
+		frame.Duration = duration
+		anim := Animation{CanvasWidth: 16, CanvasHeight: 16, Frames: []Frame{frame}}
+		if _, err := EncodeAnimationBytes(&anim, &AnimationOptions{Lossy: true}); err == nil {
+			t.Errorf("duration %d accepted", duration)
+		}
+	}
+	frame.Duration = 1<<24 - 1
+	data, err := EncodeAnimationBytes(&Animation{
+		CanvasWidth: 16, CanvasHeight: 16, Frames: []Frame{frame},
+	}, &AnimationOptions{Lossy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := ParseWebpBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := w.ANMFs[0].Duration; got != 1<<24-1 {
+		t.Fatalf("boundary duration = %d", got)
+	}
+}

@@ -67,6 +67,12 @@ func (e *encoder) chooseLumaMode(mbx, mby, bx, by int) (bool, uint8) {
 		copy(e.levels[:256], e.candLevels[:256])
 		copy(e.levels[384:], e.candLevels[384:])
 		e.lastNZ = e.candLastNZ
+		// evalLuma4 已经把亮度平面改成 4x4 的重建；16x16 赢时要把先前
+		// 存下的赢家重建放回去，否则后续宏块会从错误的像素预测。
+		// evalLuma4 left the luma plane holding its own reconstruction; when
+		// 16x16 wins we have to put the saved winner back before the next
+		// macroblock predicts from it.
+		copyBlockToPlane(d.y, bx, by, 16, e.searchY16[:])
 		return true, mode16
 	}
 	e.y4Blocks++
@@ -183,6 +189,7 @@ func (e *encoder) evalLuma16(mbx, mby, bx, by int, lambda float64) (float64, uin
 			copy(e.candLevels[:256], e.levels[:256])
 			copy(e.candLevels[384:], e.levels[384:])
 			e.candLastNZ = e.lastNZ
+			copyBlockFromPlane(e.searchY16[:], d.y, bx, by, 16)
 		}
 	}
 	d.leftMB, d.upMB[mbx] = savedLeft, savedUp
@@ -487,11 +494,15 @@ func (e *encoder) chooseChromaMode(mbx, mby, cx, cy int) uint8 {
 			bestCost, bestMode = cost, mode
 			copy(e.candLevels[256:384], e.levels[256:384])
 			copy(e.candLastNZ[16:24], e.lastNZ[16:24])
+			copyBlockFromPlane(e.searchCb[:], d.cb, cx, cy, 8)
+			copyBlockFromPlane(e.searchCr[:], d.cr, cx, cy, 8)
 		}
 	}
 	d.leftMB, d.upMB[mbx] = savedLeft, savedUp
 	copy(e.levels[256:384], e.candLevels[256:384])
 	copy(e.lastNZ[16:24], e.candLastNZ[16:24])
+	copyBlockToPlane(d.cb, cx, cy, 8, e.searchCb[:])
+	copyBlockToPlane(d.cr, cx, cy, 8, e.searchCr[:])
 	return bestMode
 }
 

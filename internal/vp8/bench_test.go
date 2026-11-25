@@ -8,6 +8,15 @@ import (
 	xvp8 "golang.org/x/image/vp8"
 )
 
+// SW_LEGACY_REUSE=1 让基准跑改动前的重算路径，用来和复用路径做同机 A/B。
+// Set SW_LEGACY_REUSE=1 to benchmark the pre-optimisation path on the same
+// machine as the reuse path.
+func init() {
+	if os.Getenv("SW_LEGACY_REUSE") != "" {
+		reuseSearchLevels = false
+	}
+}
+
 // loadVP8 从 testdata 目录读入 VP8 测试流；文件缺失时跳过基准而不是失败。
 // loadVP8 reads a VP8 test stream from the testdata directory; a missing
 // file skips the benchmark instead of failing it.

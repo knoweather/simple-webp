@@ -482,16 +482,37 @@ nothing on pure gradients).
 | # | Item | Where it stands | Plan |
 |---|---|---|---|
 | 1 | **Cost model for token probability updates** | `adaptTokenProb` uses a flat 12 bit gain threshold and never looks at `tokenUpdateProb`. About 40 % of the table entries carry an update probability of 255, which RFC 6386 §13.5 marks as "never updated"; signalling those costs ~16 bits, not the ~9 the model assumes, so an update can end up making the stream larger | Price the signalling per entry, as libwebp does in `enc/frame_enc.c` |
-| 2 | **First partition size overflow** | The 19 bit first-partition length in the frame tag is neither masked nor range checked, so a very large canvas silently corrupts the stream | Return an error when it does not fit, like libwebp's `VP8_ENC_ERROR_PARTITION0_OVERFLOW` |
-| 3 | **`LossyOptions.Sharpness`** | `internal/vp8` writes the RFC's 3 bit `sharpness_level` field correctly, but `LossyOptions` has no such field, so the value can never be set from outside the package | Add the field to `LossyOptions` (and fix the comment: like `cwebp -sharpness`, 0 is the sharpest) |
-| 4 | **Animation encoder ignores `AlphaFilter`** | The static lossy path honours `LossyOptions.AlphaFilter`; the animation path hardcodes `ALPHFilterNone` | Read `LossyOpt.AlphaFilter` in the animation encoder too |
-| 5 | **Animation `Duration` overflow** | The 24 bit field is written with a silent truncation (`1<<24` becomes 0, a negative value wraps) | Validate the range before encoding and return an error |
-| 6 | **VP8L colour indexing alpha** | The spec sets every alpha of the index image to 255; the encoder writes 0. Decoding is unaffected because the inverse transform substitutes the whole pixel | Write 255 |
-| 7 | **Duplicate VP8L transforms** | The spec allows each transform type once; the decoder accepts repeats, libwebp rejects them as corrupt | Reject duplicate transform types while decoding |
+| ~~2~~ | ~~**First partition size overflow**~~ | **Done.** `checkFirstPartition` rejects a first partition larger than `1<<19-1` with `ErrTooLarge` before writing the frame tag (`internal/vp8/encode.go`) | — |
+| ~~3~~ | ~~**`LossyOptions.Sharpness`**~~ | **Done.** The field is exposed with cwebp's 0-sharpest / 7-least-sharp meaning, validated in 0..7, and shared by still and animation lossy encodes | — |
+| ~~4~~ | ~~**Animation encoder ignores `AlphaFilter`**~~ | **Done.** Lossy animation frames now use every `LossyOpt` field: alpha filter/compression, filter level, simple filter, sharpness, segment and target size | — |
+| ~~5~~ | ~~**Animation `Duration` overflow**~~ | **Done.** `EncodeAnimationBytes` rejects durations outside 0..`1<<24-1` before writing `ANMF`; the boundary value round-trips | — |
+| ~~6~~ | ~~**VP8L colour indexing alpha**~~ | **Done.** The packed index image is written with alpha 255, matching the spec and libwebp | — |
+| ~~7~~ | ~~**Duplicate VP8L transforms**~~ | **Done.** The decoder rejects a repeated transform type as a bad bitstream | — |
 | 8 | **VP8L two dimensional distance codes** | The decoder implements the full 120 entry neighbourhood map, but the encoder always writes a plain linear distance: a one pixel distance costs ~10 bits where a neighbourhood code costs 1. This is the largest single source of the remaining lossless size gap | Add `DistanceToPlaneCode` and the lookup table to the encoder, as in libwebp's `src/enc/vp8l_enc.c` |
 | 9 | **More Huffman groups and better clustering** | The meta prefix codes use two groups; libwebp clusters into more groups and also handles the mixed photo/text case that way | Cluster into more groups |
 | 10 | **Animation frame differencing** | Every animation frame is encoded in full: there is no frame rectangle cropping and no inter-frame differencing | Add differencing and minimisation, as in libwebp's `WebPAnimEncoder` |
 | 11 | **Multi-token partitions** | The frame still uses a single residual partition, which limits decoder parallelism but not size | Emit more than one partition |
+
+On the performance side the remaining work is measured, not speculative. A
+CPU profile of a 451×451 textured q=75 encode puts `predict4` at about 14%,
+`buildMacroblock` at about 12%, `sadBlock4` at about 9% and `quantize` at about
+8%, with the serial token writer around 10%. `buildMacroblock` used to re-run
+prediction, the forward transform, quantisation and reconstruction after the
+rate-distortion search had already computed the winning block. The first pass
+now keeps the winner's levels and reconstructed pixels and skips that rebuild;
+the 12% profile figure overstated the gain because most of the block cost is
+prediction and IDCT, which the search already pays for. Same-machine interleaved
+A/B on a 640×480 q=75 encode measures about 4–5% median improvement, and
+`TestReuseSearchLevelsMatchesRecompute` checks that both paths write identical
+bytes across flat, gradient, edge and noise inputs at several qualities, sizes,
+segment settings and target sizes.
+`addIDCT4Plane`, `predict4` and `ssePlane` are still scalar on amd64, and the
+arm64/wasm paths have scalar DCT only (no NEON yet). Single-frame wavefront
+parallelism is possible in principle — macroblocks on the same `x+y` diagonal are
+independent — but the shared `encoder` scratch state makes it the largest refactor
+here. Amdahl's limit with the current 90/10 split is about 5× on ten cores, not
+the 3–4× (70/30) quoted in `fix/fix4.md`; that document's §4/§8/§9 numbers and
+its "SIMD absent" claim are stale and should be read against this section.
 
 A few further libwebp capabilities are private to it and are not part of the
 WebP bitstream, so the spec does not ask for them: `-near_lossless` source
@@ -538,6 +559,10 @@ go test ./...                 # unit tests + pixel-by-pixel fixture comparison
 go test -run XXX -bench .     # benchmarks
 go test -fuzz FuzzParseWebp   # fuzz (goal: no panic, no OOM)
 ```
+
+`SW_LEGACY_REUSE=1 go test -bench BenchmarkEncodeLossyVGA ./internal/vp8` runs
+the pre-optimisation encoder path for an A/B against the current one; the
+equivalence test toggles the same switch in-process and compares the bytes.
 
 The `internal/vp8` plane-level tests and `bench_test.go` use
 `golang.org/x/image` as a comparison oracle — test-only, never a runtime

@@ -399,9 +399,13 @@ func colorIndex(pix []uint32, width, height int) (palette []uint32, indices []ui
 			out[y*packedW+x/pixelsPerByte] = packed
 		}
 	}
-	// 打包后的索引字节放进绿色通道传输 / the packed bytes are carried in the green channel
+	// 打包后的索引字节放进绿色通道；规范要求索引图的 alpha 为 255，解码端
+	// 虽会用调色板整像素替换而忽略它，写出来仍要与 libwebp 一致。
+	// The packed bytes ride in the green channel. The spec requires the index
+	// image's alpha to be 255; the decoder replaces the whole pixel from the
+	// palette, but conformant streams still carry 0xff in the alpha channel.
 	for i := range out {
-		out[i] <<= 8
+		out[i] = out[i]<<8 | 0xff000000
 	}
 	return palette, out, packedW, true
 }

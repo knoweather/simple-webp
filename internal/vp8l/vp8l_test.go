@@ -108,3 +108,43 @@ func (w *testBits) bytes() []byte {
 	}
 	return w.buf
 }
+
+// TestColorIndexAlphaIs255 校验颜色索引图按规范把 alpha 写成 255。
+func TestColorIndexAlphaIs255(t *testing.T) {
+	const w, h = 32, 32
+	pix := make([]uint32, w*h)
+	for i := range pix {
+		pix[i] = 0xff000000 | uint32(i%4)<<8
+	}
+	_, packed, packedW, ok := colorIndex(pix, w, h)
+	if !ok {
+		t.Fatal("colorIndex refused a four-colour image")
+	}
+	if packedW != w/4 { // 四种颜色打包成每字节四个索引 / four indices per byte
+		t.Fatalf("packed width = %d", packedW)
+	}
+	for i, v := range packed {
+		if v>>24 != 0xff {
+			t.Fatalf("packed[%d] = %08x, alpha = %02x", i, v, v>>24)
+		}
+	}
+}
+
+// TestRejectDuplicateTransform 校验同一种变换出现两次时解码报错，与 libwebp
+// 的严格模式一致。
+func TestRejectDuplicateTransform(t *testing.T) {
+	var bw testBits
+	bw.writeBits(0x2f, 8) // signature
+	bw.writeBits(0, 14)   // width - 1
+	bw.writeBits(0, 14)   // height - 1
+	bw.writeBits(0, 1)    // alpha is not used
+	bw.writeBits(0, 3)    // version
+	bw.writeBits(1, 1)    // a transform follows
+	bw.writeBits(transformSubtractGreen, 2)
+	bw.writeBits(1, 1) // the same transform again
+	bw.writeBits(transformSubtractGreen, 2)
+	bw.writeBits(0, 1) // end of transforms
+	if _, _, _, err := DecodeARGB(bw.bytes()); err == nil {
+		t.Fatal("duplicate transform accepted")
+	}
+}

@@ -331,3 +331,97 @@ func TestEncodeReconstructionMatchesDecode(t *testing.T) {
 		}
 	}
 }
+
+// refImage 生成四种极端内容：平坦、渐变、硬边与噪声。它们覆盖单候选剪枝、
+// 多候选搜索、skip 宏块与全非零系数，避免单一内容掩盖复用路径的错误。
+//
+// refImage builds flat, gradient, hard-edge and noise images so the equivalence
+// test exercises single-candidate pruning, full searches, skipped macroblocks
+// and all-nonzero blocks alike.
+func refImage(kind string, w, h int) *image.YCbCr {
+	img := image.NewYCbCr(image.Rect(0, 0, w, h), image.YCbCrSubsampleRatio420)
+	rng := rand.New(rand.NewSource(42))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			var v uint8
+			switch kind {
+			case "flat":
+				v = 128
+			case "gradient":
+				v = uint8((x*3 + y*5) & 0xff)
+			case "edges":
+				v = 255
+				if (x/13+y/11)%2 == 0 {
+					v = 0
+				}
+			case "noise":
+				v = uint8(rng.Intn(256))
+			}
+			img.Y[y*img.YStride+x] = v
+		}
+	}
+	cw, ch := (w+1)/2, (h+1)/2
+	for y := 0; y < ch; y++ {
+		for x := 0; x < cw; x++ {
+			img.Cb[y*img.CStride+x] = uint8(128 + 40*math.Sin(float64(x)/3))
+			img.Cr[y*img.CStride+x] = uint8(128 + 40*math.Cos(float64(y)/4))
+		}
+	}
+	return img
+}
+
+// TestReuseSearchLevelsMatchesRecompute 对比复用与重算两条路径的码流，必须
+// 逐字节相同；覆盖 16x16/4x4、边界尺寸、分段、锐度、简单滤波与码率控制。
+//
+// TestReuseSearchLevelsMatchesRecompute checks that reusing the search results
+// writes the same bytes as recomputing them, across 16x16/4x4 macroblocks,
+// border sizes, segmentation, sharpness, simple filtering and rate control.
+func TestReuseSearchLevelsMatchesRecompute(t *testing.T) {
+	defer func() { reuseSearchLevels = true }()
+	cases := []struct {
+		name   string
+		kind   string
+		w, h   int
+		opt    Options
+		target int
+	}{
+		{"flat-q75", "flat", 64, 48, Options{Quality: 75, FilterLevel: -1}, 0},
+		{"flat-q0", "flat", 17, 13, Options{Quality: 0, FilterLevel: -1}, 0},
+		{"gradient-q30", "gradient", 160, 120, Options{Quality: 30, FilterLevel: -1}, 0},
+		{"gradient-q100", "gradient", 33, 17, Options{Quality: 100, FilterLevel: -1}, 0},
+		{"edges-q95-sharp", "edges", 96, 80, Options{Quality: 95, FilterLevel: 40, Sharpness: 7}, 0},
+		{"edges-q75-simple", "edges", 47, 31, Options{Quality: 75, FilterLevel: 20, SimpleFilter: true}, 0},
+		{"noise-q60-seg", "noise", 128, 96, Options{Quality: 60, FilterLevel: -1, Segment: true}, 0},
+		{"noise-q50-target", "noise", 96, 64, Options{Quality: 50, FilterLevel: -1}, 1200},
+	}
+	encode := func(img *image.YCbCr, opt Options, target int) ([]byte, error) {
+		if target > 0 {
+			return EncodeToTarget(img, opt, target)
+		}
+		return EncodeWithOptions(img, opt)
+	}
+	for _, c := range cases {
+		img := refImage(c.kind, c.w, c.h)
+		reuseSearchLevels = true
+		fast, err := encode(img, c.opt, c.target)
+		if err != nil {
+			t.Fatalf("%s fast: %v", c.name, err)
+		}
+		reuseSearchLevels = false
+		slow, err := encode(img, c.opt, c.target)
+		reuseSearchLevels = true
+		if err != nil {
+			t.Fatalf("%s recompute: %v", c.name, err)
+		}
+		if !bytes.Equal(fast, slow) {
+			at := 0
+			for at < len(fast) && at < len(slow) && fast[at] == slow[at] {
+				at++
+			}
+			t.Fatalf("%s: streams differ at %d (len %d vs %d)", c.name, at, len(fast), len(slow))
+		}
+		if _, err = Decode(fast); err != nil {
+			t.Fatalf("%s: decode: %v", c.name, err)
+		}
+	}
+}

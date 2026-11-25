@@ -74,6 +74,12 @@ func (d *decoder) decodeImageStream(width, height int, isLevel0 bool) ([]uint32,
 
 	var transforms []*transform
 	if isLevel0 {
+		// 规范允许每种变换最多出现一次；libwebp 把重复视为损坏码流，解码端
+		// 也要拒绝，否则会按与编码器不同的顺序叠加逆变换。
+		// The spec allows each transform type at most once. libwebp rejects
+		// repeats as corrupt, and so must we: applying two inverse transforms
+		// of the same kind would disagree with a conformant decoder.
+		var seen uint8
 		for d.br.readBit() == 1 {
 			if len(transforms) >= maxTransforms {
 				return nil, errBadBitstream
@@ -82,6 +88,11 @@ func (d *decoder) decodeImageStream(width, height int, isLevel0 bool) ([]uint32,
 			if err != nil {
 				return nil, fmt.Errorf("transform %d: %w", len(transforms), err)
 			}
+			bit := uint8(1) << uint(t.kind)
+			if seen&bit != 0 {
+				return nil, errBadBitstream
+			}
+			seen |= bit
 			transforms = append(transforms, t)
 			if t.kind == transformColorIndexing {
 				// 索引打包使存储宽度按 1<<t.bits 缩小，此处还原为子图像宽度。

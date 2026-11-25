@@ -68,6 +68,14 @@ type LossyOptions struct {
 	//
 	// SimpleFilter selects the simple filter (luma edges only).
 	SimpleFilter bool
+	// Sharpness 是环路滤波的锐度 0..7；与 cwebp -sharpness 一样，0 最锐、
+	// 7 最不锐（滤波限制的门槛越高，实际滤波越少），超出范围返回错误。
+	// 只有 FilterLevel > 0 打开滤波时才有可见效果。
+	//
+	// Sharpness is the loop-filter sharpness, 0..7. As with cwebp -sharpness,
+	// 0 is the sharpest and 7 the least sharp; an out-of-range value returns an
+	// error. It has no visible effect unless FilterLevel enables filtering.
+	Sharpness int
 	// TargetBytes 打开码率控制：在质量 0..100 之间二分，取最接近该体积的编码
 	// 结果（只对 VP8 码流生效，alpha 与元数据不计入）。0 表示按 Quality 编码。
 	//
@@ -104,6 +112,53 @@ func EncodeLossy(w io.Writer, m image.Image, opt *LossyOptions) error {
 	return err
 }
 
+// lossyVP8Options 把 LossyOptions 解析成内部 VP8 编码选项，并把目标体积单列
+// 出来。静态图与动画帧共用这份解析，避免一边改了默认值另一边没跟上。
+//
+// lossyVP8Options resolves LossyOptions into the internal VP8 options and
+// separates the target size. Still images and animation frames share this
+// parsing so a default changed in one path cannot be missed in the other.
+func lossyVP8Options(opt *LossyOptions) (vp8.Options, int, error) {
+	quality := defaultLossyQuality
+	filterLevel := -1 // 默认按质量自动 / derive the filter strength from quality
+	var simpleFilter, segment bool
+	var sharpness, targetBytes int
+	if opt != nil {
+		if opt.QualityZero {
+			quality = opt.Quality
+		} else if opt.Quality != 0 {
+			quality = opt.Quality
+		}
+		filterLevel = opt.FilterLevel
+		if filterLevel == 0 {
+			filterLevel = -1
+		}
+		simpleFilter = opt.SimpleFilter
+		sharpness = opt.Sharpness
+		segment = opt.Segment
+		targetBytes = opt.TargetBytes
+	}
+	if quality < 0 || quality > 100 {
+		return vp8.Options{}, 0, errors.Errorf("webp: quality %d out of range 0..100", quality)
+	}
+	if filterLevel < -1 || filterLevel > 63 {
+		return vp8.Options{}, 0, errors.Errorf("webp: filter level %d out of range -1..63", filterLevel)
+	}
+	if sharpness < 0 || sharpness > 7 {
+		return vp8.Options{}, 0, errors.Errorf("webp: sharpness %d out of range 0..7", sharpness)
+	}
+	if targetBytes < 0 {
+		return vp8.Options{}, 0, errors.Errorf("webp: target size %d must not be negative", targetBytes)
+	}
+	return vp8.Options{
+		Quality:      quality,
+		FilterLevel:  filterLevel,
+		SimpleFilter: simpleFilter,
+		Sharpness:    sharpness,
+		Segment:      segment,
+	}, targetBytes, nil
+}
+
 // EncodeLossyBytes 把 m 编码为完整的有损 WebP 文件并保留在内存中返回。
 // 非空的 ICCP/EXIF/XMP 直接随文件写出；三者都为空时输出仍是不带 VP8X 的简单容器。
 //
@@ -128,53 +183,24 @@ func EncodeLossyBytes(m image.Image, opt *LossyOptions) ([]byte, error) {
 	if b.Dx() <= 0 || b.Dy() <= 0 {
 		return nil, errors.New("webp: empty image")
 	}
-	quality := defaultLossyQuality
+	vp8Opt, targetBytes, err := lossyVP8Options(opt)
+	if err != nil {
+		return nil, err
+	}
 	var iccp, exif, xmp []byte
 	var alphaFilter uint8
 	var alphaUncompressed bool
-	filterLevel := -1
-	var simpleFilter bool
 	if opt != nil {
-		if opt.QualityZero {
-			quality = opt.Quality
-		} else if opt.Quality != 0 {
-			quality = opt.Quality
-		}
 		iccp, exif, xmp = opt.ICCP, opt.EXIF, opt.XMP
 		alphaFilter = opt.AlphaFilter
 		alphaUncompressed = opt.AlphaUncompressed
-		simpleFilter = opt.SimpleFilter
-		filterLevel = opt.FilterLevel
-		if filterLevel == 0 {
-			filterLevel = -1 // 0 表示自动 / zero means automatic
-		}
-	}
-	if quality < 0 || quality > 100 {
-		return nil, errors.Errorf("webp: quality %d out of range 0..100", quality)
 	}
 	if alphaFilter > ALPHFilterGradient {
 		return nil, errors.Errorf("webp: unsupported alpha filter %d", alphaFilter)
 	}
-	if filterLevel < -1 || filterLevel > 63 {
-		return nil, errors.Errorf("webp: filter level %d out of range -1..63", filterLevel)
-	}
-	if opt != nil && opt.TargetBytes < 0 {
-		return nil, errors.Errorf("webp: target size %d must not be negative", opt.TargetBytes)
-	}
 
 	ycc := imageToYCbCr420(m)
-	vp8Opt := vp8.Options{
-		Quality:      quality,
-		FilterLevel:  filterLevel,
-		SimpleFilter: simpleFilter,
-		Segment:      opt != nil && opt.Segment,
-	}
-	var targetBytes int
-	if opt != nil {
-		targetBytes = opt.TargetBytes
-	}
 	var payload []byte
-	var err error
 	if targetBytes > 0 {
 		payload, err = vp8.EncodeToTarget(ycc, vp8Opt, targetBytes)
 	} else {
